@@ -18,6 +18,7 @@
 
 import type { CatalogSource } from './CatalogSource';
 import type { ConnectError, ProviderId, RawModel } from '../types';
+import { fetchWithRetry } from '../../utils/fetchWithRetry';
 import { PROVIDER_ENDPOINTS } from '../detection/providerEndpoints';
 import type { AuthStrategy } from '../detection/providerAuth';
 import { ANTHROPIC_VERSION, appendQuery, authStrategyFor } from '../detection/providerAuth';
@@ -152,21 +153,19 @@ export class ApiProviderSource implements CatalogSource {
 
   /** Fetch one page, mapping every failure mode onto a `ProviderSourceError`. */
   private async fetchPage(url: string, auth: AuthStrategy): Promise<unknown> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-
     let res: Response;
     try {
-      res = await fetch(url, {
-        method: 'GET',
-        signal: controller.signal,
-        headers: this.requestHeaders(auth),
-      });
+      // Bounded retry on transient faults (dropped sockets, timeouts, 429/5xx,
+      // and the OpenAI-family false-404). A still-failing response is returned
+      // for classification below, exactly as the bare fetch did.
+      res = await fetchWithRetry(
+        url,
+        { method: 'GET', headers: this.requestHeaders(auth) },
+        { timeoutMs: FETCH_TIMEOUT_MS, providerId: this.providerId }
+      );
     } catch (err) {
       // A network/DNS failure or an abort (timeout) - the provider is unreachable.
       throw new ProviderSourceError('offline', describeError(err));
-    } finally {
-      clearTimeout(timer);
     }
 
     if (!res.ok) {
@@ -269,11 +268,28 @@ export class ApiProviderSource implements CatalogSource {
     const raw = entry as RawModelObject;
     if (typeof raw.id !== 'string' || raw.id.length === 0) return null;
 
-    const model: RawModel = { id: raw.id, providerId: this.providerId };
+    const model: RawModel = { id: this.stripSelfPrefix(raw.id), providerId: this.providerId };
     if (typeof raw.display_name === 'string' && raw.display_name.length > 0) {
       model.rawName = raw.display_name;
     }
     return model;
+  }
+
+  /**
+   * Strip a redundant leading `<providerId>/` self-namespace from a model id.
+   *
+   * Some providers act as their own router and list their native models under a
+   * self-prefixed id — Perplexity's `/models` returns `perplexity/sonar` — but
+   * their `/chat/completions` endpoint rejects that form and expects the bare id
+   * (`sonar`), producing an `invalid_model` 400 (#603). Only the provider's OWN
+   * prefix is removed: an upstream-vendor prefix the provider genuinely routes
+   * on (`anthropic/claude-opus-4-5` under Perplexity) is kept, and a pure router
+   * like OpenRouter — which namespaces by upstream vendor and never by itself —
+   * is never touched, because its ids never start with `openrouter/`.
+   */
+  private stripSelfPrefix(id: string): string {
+    const prefix = `${this.providerId}/`;
+    return id.startsWith(prefix) ? id.slice(prefix.length) : id;
   }
 
   /** Normalize a Gemini `models[]` entry: id derives from `name`, sans `models/` prefix. */

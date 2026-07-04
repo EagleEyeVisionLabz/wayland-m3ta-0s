@@ -43,6 +43,7 @@
     "emptyTitle": "No chats in this project yet",
     "emptyBody": "Start a chat with any backend, model or assistant. It will live under this project, and you can run as many as you like at once.",
     "untitledChat": "Untitled chat",
+    "created": "Created {{date}}",
     "removeChat": "Remove",
     "tabReference": "Reference",
     "tabMemory": "Memory",
@@ -117,7 +118,9 @@
     "fileRemoveFailed": "Could not remove the file.",
     "noWorkspaceTitle": "No workspace folder yet",
     "noWorkspaceBody": "Set a workspace folder for this project to add shared instructions, rules and reference files.",
-    "setWorkspace": "Set workspace folder"
+    "setWorkspace": "Set workspace folder",
+    "fileTooLarge": "That file is too large (max 25 MB per file).",
+    "filePartiallyAdded": "Added {{added}} file(s); {{failed}} could not be added."
   },
   "toast": {
     "created": "Project created",
@@ -203,6 +206,7 @@
       "generating": "Drafting…",
       "noModel": "Connect a model with an API key to draft with AI.",
       "failed": "Could not generate a draft.",
+      "failedReason": "Reason: {{detail}}",
       "retry": "Try again"
     },
     "back": "Back",

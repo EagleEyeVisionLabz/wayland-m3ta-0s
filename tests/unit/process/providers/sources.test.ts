@@ -84,6 +84,40 @@ describe('ApiProviderSource', () => {
     expect(models).toEqual([{ id: 'claude-opus-4', providerId: 'anthropic', rawName: 'Claude Opus 4' }]);
   });
 
+  it('strips a redundant <providerId>/ self-prefix from data-shape ids (Perplexity sonar, #603)', async () => {
+    // Perplexity's /models lists its native models self-namespaced
+    // (`perplexity/sonar`) but /chat/completions rejects that form and wants
+    // the bare id (`sonar`). The self-prefix must be stripped at ingestion.
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        data: [{ id: 'perplexity/sonar' }, { id: 'perplexity/sonar-pro' }],
+      })
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const models = await new ApiProviderSource('perplexity', 'pplx-key').listModels();
+
+    expect(models).toEqual([
+      { id: 'sonar', providerId: 'perplexity' },
+      { id: 'sonar-pro', providerId: 'perplexity' },
+    ]);
+  });
+
+  it('keeps an upstream-vendor prefix that differs from the providerId (Perplexity routing)', async () => {
+    // Perplexity also proxies other vendors; those ids are namespaced by the
+    // UPSTREAM vendor and must be sent as-is — only the self-prefix is dropped.
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        data: [{ id: 'anthropic/claude-opus-4-5' }, { id: 'perplexity/sonar' }],
+      })
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const models = await new ApiProviderSource('perplexity', 'pplx-key').listModels();
+
+    expect(models.map((m) => m.id)).toEqual(['anthropic/claude-opus-4-5', 'sonar']);
+  });
+
   it('strips the models/ prefix from Gemini ids and keeps name as rawName', async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       jsonResponse({
@@ -298,10 +332,14 @@ describe('ApiProviderSource', () => {
       // Surface the rejection so an unhandled-rejection warning is not emitted.
       const assertion = expect(pending).rejects.toMatchObject({ code: 'offline' });
 
-      // Advance past the 15s fetch-timeout constant - the setTimeout fires and aborts.
-      await vi.advanceTimersByTimeAsync(15_000);
+      // fetchWithRetry runs 3 attempts: each 15s per-attempt timeout aborts the
+      // hung fetch, then a bounded backoff precedes the next attempt. Advance
+      // through every attempt + backoff so the retry budget is spent and the
+      // final AbortError surfaces as `offline` (3*15s timeouts + 2 backoffs,
+      // padded for jitter). This is fake time, so the test still runs in ms.
+      await vi.advanceTimersByTimeAsync(60_000);
       await assertion;
-      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock).toHaveBeenCalledTimes(3);
     } finally {
       vi.useRealTimers();
     }
@@ -358,6 +396,18 @@ describe('ApiProviderSource', () => {
 
     const [url] = fetchMock.mock.calls[0] as [string];
     expect(url).toBe('https://my-gateway.example.com/v1/models');
+  });
+
+  // #166 - Perplexity's models endpoint is versioned (`/v1/models`); a bare
+  // `/models` 404s, fails the catalog fetch, and the provider never connects.
+  it('targets Perplexity at the versioned /v1/models endpoint (#166)', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ data: [{ id: 'sonar' }] }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await new ApiProviderSource('perplexity', 'pplx-test').listModels();
+
+    const [url] = fetchMock.mock.calls[0] as [string];
+    expect(url).toBe('https://api.perplexity.ai/v1/models');
   });
 });
 

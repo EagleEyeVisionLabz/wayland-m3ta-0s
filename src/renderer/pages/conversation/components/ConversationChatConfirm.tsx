@@ -1,5 +1,6 @@
 import { ipcBridge } from '@/common';
 import type { IConfirmation } from '@/common/chat/chatLib';
+import { redactCommandSecrets } from '@/common/utils/redactCommandSecrets';
 import { useConversationContextSafe } from '@/renderer/hooks/context/ConversationContext';
 import { Divider, Typography } from '@arco-design/web-react';
 import type { PropsWithChildren } from 'react';
@@ -143,6 +144,7 @@ const ConversationChatConfirm: React.FC<PropsWithChildren<{ conversation_id: str
         callId: confirmation.callId,
         msg_id: confirmation.id,
         data: option.value,
+        answer: option.answer, // #504: the picked AskUserQuestion choice
       });
     };
 
@@ -262,19 +264,25 @@ const ConversationChatConfirm: React.FC<PropsWithChildren<{ conversation_id: str
         >
           <div className='flex-1 overflow-y-auto min-h-0'>
             <Typography.Ellipsis className='text-16px font-bold color-[var(--text-primary)]' rows={2} expandable>
-              {$t(confirmation.title) || 'Choose an action'}
+              {/* #610: mask inline secrets - the wcore/acp mapper puts the real
+                  command in the confirmation title/description ("Execute: <cmd>"). */}
+              {redactCommandSecrets($t(confirmation.title)) || 'Choose an action'}
             </Typography.Ellipsis>
             <Divider className={'!my-10px'}></Divider>
             <Typography.Ellipsis className='text-14px color-[var(--text-primary)]' rows={5} expandable>
-              {$t(confirmation.description)}
+              {redactCommandSecrets($t(confirmation.description))}
             </Typography.Ellipsis>
           </div>
           <div className='shrink-0'>
             {confirmation.options.map((option, index) => {
               const label = $t(option.label, option.params);
-              // Determine shortcut hint for this option
-              const shortcut =
-                index === 0
+              // #504: an AskUserQuestion choice carries an `answer`; number those
+              // so the 1-9 keyboard shortcuts line up. Ordinary approve/deny keep
+              // their Enter/Y/A/Esc hints.
+              const isChoice = option.answer != null;
+              const shortcut = isChoice
+                ? String(index + 1)
+                : index === 0
                   ? 'Enter'
                   : option.value === 'cancel'
                     ? 'Esc'
@@ -293,15 +301,35 @@ const ConversationChatConfirm: React.FC<PropsWithChildren<{ conversation_id: str
                       callId: confirmation.callId,
                       msg_id: confirmation.id,
                       data: option.value,
+                      answer: option.answer, // #504: the picked AskUserQuestion choice
                     });
                   }}
                   key={label + option.value + index}
-                  className='b-1px b-solid h-30px lh-30px b-[var(--border-base)] rd-8px px-12px hover:bg-[var(--bg-hover)] cursor-pointer mt-10px flex items-center gap-8px color-[var(--text-primary)]'
+                  data-testid={option.answer != null ? 'confirm-question-choice' : 'confirm-option'}
+                  className='b-1px b-solid min-h-30px b-[var(--border-base)] rd-8px px-12px py-6px leading-snug hover:bg-[var(--bg-hover)] cursor-pointer mt-10px flex items-start gap-8px color-[var(--text-primary)]'
                 >
-                  <span className='inline-flex items-center justify-center px-4px h-18px rd-4px bg-[var(--bg-2)] text-11px text-[var(--text-secondary)] font-mono shrink-0'>
+                  <span className='inline-flex items-center justify-center px-4px h-18px rd-4px bg-[var(--bg-2)] text-11px text-[var(--text-secondary)] font-mono shrink-0 mt-1px'>
                     {shortcut}
                   </span>
-                  {label}
+                  <span className='min-w-0'>
+                    <span>
+                      {label}
+                      {/* #504: the first choice is the one yolo/full-auto
+                          auto-picks (choices[0]), so flag it as the recommended
+                          answer. Visual only - the sent answer is unchanged. */}
+                      {isChoice && index === 0 && (
+                        <span
+                          data-testid='confirm-question-recommended'
+                          className='ml-6px inline-flex items-center px-6px h-16px rd-4px bg-[var(--bg-2)] text-10px color-[var(--text-secondary)] align-middle'
+                        >
+                          {$t('messages.confirmation.recommended')}
+                        </span>
+                      )}
+                    </span>
+                    {option.description && (
+                      <span className='block text-12px color-[var(--text-secondary)] mt-2px'>{option.description}</span>
+                    )}
+                  </span>
                 </div>
               );
             })}

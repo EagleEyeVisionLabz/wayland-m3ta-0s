@@ -43,6 +43,7 @@
     "emptyTitle": "Nenhuma conversa neste projeto ainda",
     "emptyBody": "Inicie uma conversa com qualquer backend, modelo ou assistente. Ela ficará dentro deste projeto, e você pode rodar quantas quiser ao mesmo tempo.",
     "untitledChat": "Conversa sem título",
+    "created": "Criado {{date}}",
     "removeChat": "Remover",
     "tabReference": "Referência",
     "tabMemory": "Memória",
@@ -117,7 +118,8 @@
     "fileRemoveFailed": "Não foi possível remover o arquivo.",
     "noWorkspaceTitle": "Nenhuma pasta de workspace ainda",
     "noWorkspaceBody": "Defina uma pasta de workspace para este projeto para adicionar instruções, regras e arquivos de referência compartilhados.",
-    "setWorkspace": "Definir pasta do workspace"
+    "setWorkspace": "Definir pasta do workspace",
+    "fileTooLarge": "That file is too large (max 25 MB per file)."
   },
   "toast": {
     "created": "Projeto criado",

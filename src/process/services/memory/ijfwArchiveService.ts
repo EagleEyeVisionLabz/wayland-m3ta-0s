@@ -17,6 +17,7 @@ import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import log from 'electron-log';
 import { parseMarkdownBlocks } from './markdownFrontmatter';
+import { applyDelete, applyEdit, type MemoryBlockPatch } from './memoryEntryMutation';
 import { computePromotionScore } from './promotionScore';
 import type {
   MemoryEntry,
@@ -28,8 +29,46 @@ import type {
   IndexStats,
 } from '@/common/types/memory';
 
-// Memory files to read per project root.
-const MEMORY_FILES = ['knowledge.md', 'journal.md', 'handoff.md', 'plan.md', 'brief.md', 'project-journal.md'] as const;
+// Depth of subdirectory recursion when scanning a project's .ijfw/memory dir.
+// IJFW writes durable entries both at the memory-dir root (e.g. knowledge.md,
+// journal.md, dev-scan files) AND under one level of subdirectories (e.g.
+// `global/preferences.md`). We scan the root plus its immediate subdirs so
+// those nested files are not silently dropped. We do NOT recurse deeper to
+// avoid walking unrelated trees (e.g. gate-receipts/).
+const MEMORY_SCAN_MAX_DEPTH = 1;
+
+/**
+ * Recursively collect `*.md` files under a project's `.ijfw/memory` dir,
+ * bounded by {@link MEMORY_SCAN_MAX_DEPTH}.
+ *
+ * Historical bug (GitHub #110): the reader used a hardcoded filename allowlist
+ * (`knowledge.md`, `journal.md`, …). Real IJFW installs write durable memory to
+ * arbitrarily-named files (`devscan-<hash>.md`) and to nested dirs
+ * (`global/preferences.md`), so the archive/wiki UI showed "your memory is
+ * empty" even though parseable frontmatter entries existed on disk. We now scan
+ * every markdown file; flat files with no frontmatter blocks (e.g.
+ * `project-journal.md`) naturally yield zero entries and are skipped downstream.
+ */
+async function collectMemoryFiles(dir: string, depth = 0): Promise<string[]> {
+  let dirents: fs.Dirent[];
+  try {
+    dirents = await fs.promises.readdir(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const files: string[] = [];
+  for (const dirent of dirents) {
+    const full = path.join(dir, dirent.name);
+    if (dirent.isDirectory()) {
+      if (depth < MEMORY_SCAN_MAX_DEPTH) {
+        files.push(...(await collectMemoryFiles(full, depth + 1)));
+      }
+    } else if (dirent.isFile() && dirent.name.endsWith('.md')) {
+      files.push(full);
+    }
+  }
+  return files;
+}
 
 type WatcherFactory = (
   filePath: string,
@@ -148,11 +187,28 @@ function parseEntriesFromFile(filePath: string, projectPath: string, projectName
         ? fm['summary']
         : block.body.split('\n')[0].replace(/^#+\s*/, '') || 'Untitled';
 
-    const storedStr = typeof fm['stored'] === 'string' ? fm['stored'] : '';
+    // S14: importers (drag-drop/Obsidian/claude-mem) write `created:` for the
+    // date, but the reader historically only read `stored:`. Without the
+    // `created` fallback every imported entry got storedAt=Date.now() on each
+    // reindex, polluting 24h/7d deltas, the sparkline and the streak. Prefer
+    // `created`, fall back to the legacy `stored` key so existing files are
+    // unchanged.
+    const storedStr =
+      (typeof fm['created'] === 'string' && fm['created'] ? fm['created'] : '') ||
+      (typeof fm['stored'] === 'string' ? fm['stored'] : '');
     const storedAt = parseDateToMs(storedStr) || Date.now();
 
     const rawTags = fm['tags'];
     const tags: string[] = Array.isArray(rawTags) ? rawTags : typeof rawTags === 'string' && rawTags ? [rawTags] : [];
+
+    // S14: importers write `scope: global` (with empty tags) instead of a
+    // `global` tag, so scope:global entries never appeared under the Global
+    // filter (which keys off tags.includes('global')). Treat scope:global as
+    // global membership by adding the tag when it is not already present; this
+    // wires the existing Global filter / tag index without touching either.
+    if (typeof fm['scope'] === 'string' && fm['scope'].trim().toLowerCase() === 'global' && !tags.includes('global')) {
+      tags.push('global');
+    }
 
     const id = makeId(filePath, storedStr || String(storedAt), summary);
     const bodyPreview = stripMarkdown(block.body).slice(0, 200);
@@ -314,6 +370,16 @@ class IjfwArchiveService {
       registryEntries = await fallbackScanForProjects();
     }
 
+    // GitHub #137: the global "home brain" at ~/.ijfw/memory is where the in-app
+    // importers (Obsidian, claude-mem, drag-drop) and quickAdd('global') write
+    // (see importBridge.resolveMemoryDir and quickAdd above). The registry /
+    // dev-scan only enumerate per-project memory dirs, so without injecting the
+    // home dir the imported memories were never scanned and the memory tab
+    // rendered empty. It is added as an ordinary candidate: the access-check
+    // below drops it when ~/.ijfw/memory does not exist, so installs that never
+    // imported are unaffected.
+    registryEntries = [...registryEntries, { path: os.homedir(), lastSeen: 0 }];
+
     // Deduplicate by normalized path.
     const seen = new Set<string>();
     const projectPaths: RegistryEntry[] = [];
@@ -335,25 +401,30 @@ class IjfwArchiveService {
     const projectSummaries: ProjectSummary[] = [];
     const wikiCounts = new Map<string, number>();
 
-    for (const { path: pPath, lastSeen } of projectPaths) {
-      const memDir = path.join(pPath, '.ijfw', 'memory');
+    // Scan every project's memory dir up front, in parallel, so the per-project
+    // index loop below stays synchronous (no await-in-loop). Each project's
+    // entry is `[markdownFilePaths, wikiFileCount]`.
+    const scans = await Promise.all(
+      projectPaths.map(async ({ path: pPath }) => {
+        const memDir = path.join(pPath, '.ijfw', 'memory');
+        const [memoryFiles, wikiCount] = await Promise.all([collectMemoryFiles(memDir), countWikiFiles(pPath)]);
+        return { memoryFiles, wikiCount };
+      })
+    );
+
+    for (let p = 0; p < projectPaths.length; p++) {
+      const { path: pPath, lastSeen } = projectPaths[p];
+      const { memoryFiles, wikiCount } = scans[p];
       const projectName = path.basename(pPath);
       const projectEntries: MemoryEntry[] = [];
 
-      for (const fileName of MEMORY_FILES) {
-        const filePath = path.join(memDir, fileName);
-        try {
-          await fs.promises.access(filePath);
-        } catch {
-          continue;
-        }
+      for (const filePath of memoryFiles) {
         const parsed = parseEntriesFromFile(filePath, pPath, projectName);
         projectEntries.push(...parsed);
         this.watchFile(filePath);
       }
 
       allEntries.push(...projectEntries);
-      const wikiCount = await countWikiFiles(pPath);
       wikiCounts.set(projectName, wikiCount);
 
       const maxStored = projectEntries.reduce((m, e) => Math.max(m, e.storedAt), lastSeen);
@@ -720,6 +791,99 @@ class IjfwArchiveService {
     this.scheduleReindex();
   }
 
+  /**
+   * Delete a single memory entry (#414). Hard delete: the entry's `---`-block is
+   * removed from its source file (atomic write); if it was the file's last entry
+   * the file is unlinked. Every other entry in the file is preserved verbatim.
+   * The store is git-tracked, so this is recoverable outside the app.
+   */
+  async deleteEntry(id: string): Promise<{ ok: boolean; error?: string }> {
+    await this.init();
+    const entry = this.index.byId.get(id);
+    if (!entry) return { ok: false, error: 'not_found' };
+    if (!isManagedMemoryPath(entry.sourcePath)) return { ok: false, error: 'unmanaged_path' };
+
+    let content: string;
+    try {
+      content = await fs.promises.readFile(entry.sourcePath, 'utf8');
+    } catch {
+      return { ok: false, error: 'read_failed' };
+    }
+
+    const result = applyDelete(content, entry.summary);
+    if (result.ok === false) return { ok: false, error: result.error };
+
+    try {
+      if (result.remainingBlocks === 0) await fs.promises.unlink(entry.sourcePath);
+      else await atomicWriteFile(entry.sourcePath, result.content);
+    } catch (err) {
+      log.error('[memory-archive] deleteEntry write failed', { id, err });
+      return { ok: false, error: 'write_failed' };
+    }
+
+    await this.rebuildNow();
+    return { ok: true };
+  }
+
+  /**
+   * Edit a single memory entry in place (#414). Surgical: only the patched
+   * frontmatter keys (summary/type/tags) and body are rewritten; all other
+   * frontmatter and all other entries are preserved verbatim. Because the id is
+   * derived from (sourcePath, stored, summary), changing the summary changes the
+   * id — the new id is returned so the caller can re-select the entry.
+   */
+  async editEntry(id: string, patch: MemoryBlockPatch): Promise<{ ok: boolean; error?: string; newId?: string }> {
+    await this.init();
+    const entry = this.index.byId.get(id);
+    if (!entry) return { ok: false, error: 'not_found' };
+    if (!isManagedMemoryPath(entry.sourcePath)) return { ok: false, error: 'unmanaged_path' };
+
+    let content: string;
+    try {
+      content = await fs.promises.readFile(entry.sourcePath, 'utf8');
+    } catch {
+      return { ok: false, error: 'read_failed' };
+    }
+
+    const result = applyEdit(content, entry.summary, patch);
+    if (result.ok === false) return { ok: false, error: result.error };
+
+    try {
+      await atomicWriteFile(entry.sourcePath, result.content);
+    } catch (err) {
+      log.error('[memory-archive] editEntry write failed', { id, err });
+      return { ok: false, error: 'write_failed' };
+    }
+
+    await this.rebuildNow();
+
+    // Resolve the (possibly new) id after the summary change. `stored` is never
+    // patchable, so storedAt is stable across the edit — match on it too, so a
+    // renamed summary that now collides (first 80 chars) with a SIBLING entry in
+    // the same file cannot re-resolve to the wrong block's id.
+    const newSummary = (patch.summary ?? entry.summary).slice(0, 80);
+    const updated = this.index.all.find(
+      (e) => e.sourcePath === entry.sourcePath && e.storedAt === entry.storedAt && e.summary.slice(0, 80) === newSummary
+    );
+    return { ok: true, newId: updated?.id ?? id };
+  }
+
+  /**
+   * Force an immediate, awaited reindex (used after edit/delete so the caller's
+   * next read reflects the change). Mirrors the debounced scheduleReindex body
+   * but runs synchronously and fires the change callbacks.
+   */
+  private async rebuildNow(): Promise<void> {
+    if (this.debounceTimer !== null) {
+      clearTimeout(this.debounceTimer);
+      this.debounceTimer = null;
+    }
+    this.closeWatchers();
+    await this.buildIndex();
+    const stats = this.indexStats();
+    for (const cb of this.changeCallbacks) cb(stats);
+  }
+
   indexStats(): IndexStats {
     return {
       total: this.index.all.length,
@@ -745,6 +909,26 @@ class IjfwArchiveService {
  */
 function sanitizeYamlScalar(s: string): string {
   return s.replace(/[\r\n]+/g, ' ').slice(0, 200);
+}
+
+/**
+ * Write via temp file + rename so the file watcher never observes a partial
+ * write (mirrors wikiWriter.atomicWrite).
+ */
+async function atomicWriteFile(filePath: string, contents: string): Promise<void> {
+  const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}`;
+  await fs.promises.writeFile(tmp, contents, 'utf8');
+  await fs.promises.rename(tmp, filePath);
+}
+
+/**
+ * Guard for mutating operations: only ever touch files inside a `.ijfw/memory`
+ * store. All service sourcePaths come from there, but this makes the invariant
+ * explicit so an edit/delete can never escape the store.
+ */
+function isManagedMemoryPath(filePath: string): boolean {
+  const norm = filePath.replace(/\\/g, '/');
+  return norm.includes('/.ijfw/memory/');
 }
 
 function groupBy<T>(items: T[], key: (item: T) => string): Map<string, T[]> {

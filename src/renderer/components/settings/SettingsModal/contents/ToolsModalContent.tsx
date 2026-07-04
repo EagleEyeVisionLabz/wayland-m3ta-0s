@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { CheckCircle2, ChevronDown, HelpCircle, Plus, RotateCcw } from 'lucide-react';
+import { CheckCircle2, RotateCcw } from 'lucide-react';
 import {
   ConfigStorage,
   type IConfigStorageRefer,
@@ -13,40 +13,26 @@ import {
 } from '@/common/config/storage';
 import type { SpeechToTextConfig, SpeechToTextProvider } from '@/common/types/speech';
 import type { TextToSpeechConfig, TextToSpeechProvider } from '@/common/types/ttsTypes';
-import { DEFAULT_TTS_CONFIG, normalizeTextToSpeechConfig } from '@/common/types/ttsTypes';
-import { acpConversation, voiceAsset } from '@/common/adapter/ipcBridge';
-import type { VoiceAsset } from '@/common/types/voiceAsset';
+import { modelRegistry, voiceAsset } from '@/common/adapter/ipcBridge';
 import {
-  Divider,
-  Form,
-  Tooltip,
-  Message,
-  Button,
-  Dropdown,
-  Menu,
-  Modal,
-  Switch,
-  Input,
-  Slider,
-  Progress,
-} from '@arco-design/web-react';
+  isImageModelName,
+  imageModelDisplayLabel,
+  isFluxProviderRow,
+  FLUX_RECOMMENDED_IMAGE_ID,
+} from '@/common/config/imageModels';
+import type { VoiceAsset } from '@/common/types/voiceAsset';
+import { Divider, Form, Message, Button, Switch, Input, Slider, Progress } from '@arco-design/web-react';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import useConfigModelListWithImage from '@/renderer/hooks/agent/useConfigModelListWithImage';
 import WaylandScrollArea from '@/renderer/components/base/WaylandScrollArea';
 import WaylandSelect from '@/renderer/components/base/WaylandSelect';
 import McpAgentStatusDisplay from '@/renderer/pages/settings/ToolsSettings/McpAgentStatusDisplay';
-import {
-  useMcpServers,
-  useMcpAgentStatus,
-  useMcpOperations,
-} from '@/renderer/hooks/mcp';
+import { useMcpServers, useMcpAgentStatus, useMcpOperations } from '@/renderer/hooks/mcp';
 import classNames from 'classnames';
 import { useNavigate } from 'react-router-dom';
 import { useSettingsViewMode } from '../settingsViewContext';
 import MicrophoneCheck from '@/renderer/pages/settings/VoiceSettings/MicrophoneCheck';
-
-type MessageInstance = ReturnType<typeof Message.useMessage>[0];
 
 const isBuiltinImageGenServer = (server: IMcpServer) => server.builtin === true && server.id === BUILTIN_IMAGE_GEN_ID;
 export const SPEECH_TO_TEXT_CONFIG_CHANGED_EVENT = 'wayland:speech-to-text-config-changed';
@@ -58,6 +44,12 @@ export const DEFAULT_SPEECH_TO_TEXT_CONFIG: SpeechToTextConfig = {
     baseUrl: '',
     language: '',
     model: 'whisper-1',
+  },
+  fluxVoice: {
+    apiKey: '',
+    baseUrl: '',
+    language: '',
+    model: 'flux-voice',
   },
   deepgram: {
     apiKey: '',
@@ -76,6 +68,10 @@ export const normalizeSpeechToTextConfig = (config?: SpeechToTextConfig): Speech
   openai: {
     ...DEFAULT_SPEECH_TO_TEXT_CONFIG.openai,
     ...config?.openai,
+  },
+  fluxVoice: {
+    ...DEFAULT_SPEECH_TO_TEXT_CONFIG.fluxVoice,
+    ...config?.fluxVoice,
   },
   deepgram: {
     ...DEFAULT_SPEECH_TO_TEXT_CONFIG.deepgram,
@@ -103,25 +99,28 @@ const WHISPER_MODEL_ASSETS: Record<string, VoiceAsset> = {
 
 type DownloadState = 'idle' | 'downloading' | 'success' | 'error';
 
-const WhisperLocalDownloadControl: React.FC<{
-  model: string;
-  onModelChange: (model: string) => void;
-}> = ({ model, onModelChange }) => {
-  const { t } = useTranslation();
+/**
+ * Shared download-with-progress controller for the local voice models (Whisper
+ * + Kokoro). Owns the download lifecycle, the on-disk install probe, and the
+ * live progress subscription so both controls render a real <Progress/> bar
+ * instead of the old hardcoded 0%. Pass `undefined` when no asset is selected
+ * (the hook stays inert until one is).
+ */
+const useVoiceAssetDownload = (asset: VoiceAsset | undefined) => {
   const [downloadState, setDownloadState] = useState<DownloadState>('idle');
   const [errorMsg, setErrorMsg] = useState('');
   const [installed, setInstalled] = useState<boolean | null>(null);
-  const cancelledRef = React.useRef(false);
+  const [percent, setPercent] = useState(0);
+  const cancelledRef = useRef(false);
+  const assetId = asset?.id;
 
-  // Probe install state on mount + every model switch so the UI shows
-  // "Installed" instead of a Download button when the file already exists
-  // on disk. Krug / Sutherland: don't make the user wonder.
+  // Probe install state on mount + every asset switch and after each download
+  // so the UI flips to "Installed" when the file already exists on disk.
   useEffect(() => {
+    if (!assetId) return;
     let cancelled = false;
-    const asset = WHISPER_MODEL_ASSETS[model];
-    if (!asset) return;
     void voiceAsset.exists
-      .invoke({ id: asset.id })
+      .invoke({ id: assetId })
       .then((r) => {
         if (!cancelled) setInstalled(Boolean(r?.installed));
       })
@@ -131,12 +130,26 @@ const WhisperLocalDownloadControl: React.FC<{
     return () => {
       cancelled = true;
     };
-  }, [model, downloadState]);
+  }, [assetId, downloadState]);
+
+  // Subscribe to streamed progress and translate bytes into a percentage.
+  // When the server omits Content-Length totalBytes is null and we stay at 0
+  // (indeterminate) rather than dividing by nothing.
+  useEffect(() => {
+    if (!assetId) return;
+    const removeListener = voiceAsset.downloadProgress.on((evt) => {
+      if (!evt || evt.assetId !== assetId) return;
+      setPercent(evt.totalBytes ? Math.min(100, Math.round((evt.bytesDownloaded / evt.totalBytes) * 100)) : 0);
+    });
+    return () => {
+      removeListener();
+    };
+  }, [assetId]);
 
   const handleDownload = useCallback(async () => {
-    const asset = WHISPER_MODEL_ASSETS[model];
     if (!asset) return;
     cancelledRef.current = false;
+    setPercent(0);
     setDownloadState('downloading');
     setErrorMsg('');
     try {
@@ -148,16 +161,28 @@ const WhisperLocalDownloadControl: React.FC<{
         setErrorMsg(err instanceof Error ? err.message : String(err));
       }
     }
-  }, [model]);
+  }, [asset]);
 
   const handleCancel = useCallback(async () => {
     cancelledRef.current = true;
-    const asset = WHISPER_MODEL_ASSETS[model];
-    if (asset) {
-      await voiceAsset.cancel.invoke({ assetId: asset.id }).catch(() => {});
+    if (assetId) {
+      await voiceAsset.cancel.invoke({ assetId }).catch(() => {});
     }
     setDownloadState('idle');
-  }, [model]);
+    setPercent(0);
+  }, [assetId]);
+
+  return { downloadState, errorMsg, installed, percent, handleDownload, handleCancel };
+};
+
+const WhisperLocalDownloadControl: React.FC<{
+  model: string;
+  onModelChange: (model: string) => void;
+}> = ({ model, onModelChange }) => {
+  const { t } = useTranslation();
+  const { downloadState, errorMsg, installed, percent, handleDownload, handleCancel } = useVoiceAssetDownload(
+    WHISPER_MODEL_ASSETS[model]
+  );
 
   return (
     <>
@@ -170,17 +195,12 @@ const WhisperLocalDownloadControl: React.FC<{
       <Form.Item label={t('settings.speechToTextDownloadModel')}>
         <div className='flex flex-col gap-8px'>
           {downloadState === 'downloading' ? (
-            <>
-              <div className='flex items-center gap-8px'>
-                <Progress percent={0} animation className='flex-1' />
-                <Button size='mini' onClick={handleCancel}>
-                  {t('settings.speechToTextCancelDownload')}
-                </Button>
-              </div>
-              <span className='text-12px text-t-tertiary'>
-                {t('settings.speechToTextDownloadProgressNotReported', 'Downloading… (progress reporting coming soon)')}
-              </span>
-            </>
+            <div className='flex items-center gap-8px'>
+              <Progress percent={percent} animation className='flex-1' />
+              <Button size='mini' onClick={handleCancel}>
+                {t('settings.speechToTextCancelDownload')}
+              </Button>
+            </div>
           ) : installed ? (
             <div className='flex items-center justify-between gap-8px h-32px px-12px rd-8px bg-[var(--color-fill-2)]'>
               <span className='flex items-center gap-8px text-12px text-[var(--success)]'>
@@ -231,48 +251,14 @@ export const TextToSpeechSettingsSection: React.FC<{
   onChange: (updater: (current: TextToSpeechConfig) => TextToSpeechConfig) => void;
 }> = ({ config, onChange }) => {
   const { t } = useTranslation();
-  const [downloadState, setDownloadState] = useState<DownloadState>('idle');
-  const [errorMsg, setErrorMsg] = useState('');
-  const [installed, setInstalled] = useState<boolean | null>(null);
-  const cancelledRef = React.useRef(false);
-
-  // Same install probe as Whisper - flip the UI from "Download Model" to
-  // "Installed" when the on-disk file already exists.
-  useEffect(() => {
-    let cancelled = false;
-    void voiceAsset.exists
-      .invoke({ id: KOKORO_ASSET.id })
-      .then((r) => {
-        if (!cancelled) setInstalled(Boolean(r?.installed));
-      })
-      .catch(() => {
-        if (!cancelled) setInstalled(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [downloadState]);
-
-  const handleDownloadKokoro = useCallback(async () => {
-    cancelledRef.current = false;
-    setDownloadState('downloading');
-    setErrorMsg('');
-    try {
-      await voiceAsset.download.invoke(KOKORO_ASSET);
-      if (!cancelledRef.current) setDownloadState('success');
-    } catch (err) {
-      if (!cancelledRef.current) {
-        setDownloadState('error');
-        setErrorMsg(err instanceof Error ? err.message : String(err));
-      }
-    }
-  }, []);
-
-  const handleCancelDownload = useCallback(async () => {
-    cancelledRef.current = true;
-    await voiceAsset.cancel.invoke({ assetId: KOKORO_ASSET.id }).catch(() => {});
-    setDownloadState('idle');
-  }, []);
+  const {
+    downloadState,
+    errorMsg,
+    installed,
+    percent,
+    handleDownload: handleDownloadKokoro,
+    handleCancel: handleCancelDownload,
+  } = useVoiceAssetDownload(KOKORO_ASSET);
 
   const handleProviderChange = useCallback(
     (value: string) => {
@@ -311,7 +297,7 @@ export const TextToSpeechSettingsSection: React.FC<{
 
       <Divider className='mt-0px mb-20px' />
 
-      <Form layout='horizontal' labelAlign='left' className='space-y-12px'>
+      <Form layout='horizontal' labelAlign='left' className='space-y-12px wayland-stack-form-mobile'>
         <Form.Item label={t('settings.textToSpeechProvider')}>
           <div className='flex items-center gap-8px'>
             <WaylandSelect value={config.provider} onChange={handleProviderChange} className='flex-1'>
@@ -363,7 +349,7 @@ export const TextToSpeechSettingsSection: React.FC<{
             <div className='flex flex-col gap-8px'>
               {downloadState === 'downloading' ? (
                 <div className='flex items-center gap-8px'>
-                  <Progress percent={0} animation className='flex-1' />
+                  <Progress percent={percent} animation className='flex-1' />
                   <Button size='mini' onClick={handleCancelDownload}>
                     {t('settings.textToSpeechCancelDownload')}
                   </Button>
@@ -408,6 +394,26 @@ export const SpeechToTextSettingsSection: React.FC<{
 }> = ({ config, onChange }) => {
   const { t } = useTranslation();
   const navigate = useNavigate();
+  // Whether OpenAI is connected in the shared provider registry (the same store
+  // Models/Providers shows as "Connected"). When it is, OpenAI Whisper uses that
+  // key automatically, so the panel confirms the key is present instead of
+  // telling the user to go configure it.
+  const [openAIConnected, setOpenAIConnected] = useState<boolean | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    void modelRegistry.list
+      .invoke()
+      .then((providers) => {
+        if (cancelled) return;
+        setOpenAIConnected(providers.some((p) => p.providerId === 'openai' && p.state === 'connected'));
+      })
+      .catch(() => {
+        if (!cancelled) setOpenAIConnected(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   const handleOpenProvidersPage = useCallback(() => {
     try {
       navigate('/settings/models');
@@ -486,7 +492,7 @@ export const SpeechToTextSettingsSection: React.FC<{
 
       <Divider className='mt-0px mb-20px' />
 
-      <Form layout='horizontal' labelAlign='left' className='space-y-12px'>
+      <Form layout='horizontal' labelAlign='left' className='space-y-12px wayland-stack-form-mobile'>
         <Form.Item label={t('settings.speechToTextProvider')}>
           <WaylandSelect value={config.provider} onChange={handleProviderChange}>
             <WaylandSelect.Option value='openai'>{t('settings.speechToTextProviderOpenAI')}</WaylandSelect.Option>
@@ -504,22 +510,45 @@ export const SpeechToTextSettingsSection: React.FC<{
         {config.provider === 'openai' ? (
           <>
             <Form.Item label={renderSpeechToTextFieldLabel('settings.speechToTextApiKey', 'required')}>
-              <div className='rounded-12px bg-[var(--color-fill-2)] p-12px flex items-center justify-between gap-12px'>
-                <div>
-                  <div className='text-13px font-medium text-t-primary'>
-                    {t('settings.voiceProviderKeyDeferTitle', 'Configure your OpenAI key in Providers')}
+              {/* Three distinct states: connected (true) shows the "using your
+                  key" banner; not-connected (false) shows the configure/defer
+                  banner; loading (null) renders nothing so the defer banner -
+                  the exact Bug B symptom - never flashes for a connected user. */}
+              {openAIConnected === true ? (
+                <div className='rounded-12px bg-[var(--color-fill-2)] p-12px flex flex-col sm:flex-row sm:items-center sm:justify-between gap-12px'>
+                  <div className='min-w-0'>
+                    <div className='text-13px font-medium text-t-primary'>
+                      {t('settings.voiceProviderKeyConnectedTitle', 'Using your connected OpenAI key')}
+                    </div>
+                    <div className='text-12px text-t-secondary'>
+                      {t(
+                        'settings.voiceProviderKeyConnectedBody',
+                        'Speech-to-text uses the OpenAI provider you connected in Models. No extra key needed here.'
+                      )}
+                    </div>
                   </div>
-                  <div className='text-12px text-t-secondary'>
-                    {t(
-                      'settings.voiceProviderKeyDeferBody',
-                      'Provider keys live in one place so every feature can use them.'
-                    )}
-                  </div>
+                  <Button size='small' className='w-full sm:w-auto shrink-0' onClick={handleOpenProvidersPage}>
+                    {t('settings.voiceProviderKeyManageCTA', 'Manage in Providers →')}
+                  </Button>
                 </div>
-                <Button size='small' className='' onClick={handleOpenProvidersPage}>
-                  {t('settings.voiceProviderKeyDeferCTA', 'Open Providers →')}
-                </Button>
-              </div>
+              ) : openAIConnected === false ? (
+                <div className='rounded-12px bg-[var(--color-fill-2)] p-12px flex flex-col sm:flex-row sm:items-center sm:justify-between gap-12px'>
+                  <div className='min-w-0'>
+                    <div className='text-13px font-medium text-t-primary'>
+                      {t('settings.voiceProviderKeyDeferTitle', 'Configure your OpenAI key in Providers')}
+                    </div>
+                    <div className='text-12px text-t-secondary'>
+                      {t(
+                        'settings.voiceProviderKeyDeferBody',
+                        'Provider keys live in one place so every feature can use them.'
+                      )}
+                    </div>
+                  </div>
+                  <Button size='small' className='w-full sm:w-auto shrink-0' onClick={handleOpenProvidersPage}>
+                    {t('settings.voiceProviderKeyDeferCTA', 'Open Providers →')}
+                  </Button>
+                </div>
+              ) : null}
             </Form.Item>
             <Form.Item label={renderSpeechToTextFieldLabel('settings.speechToTextBaseUrl', 'optional')}>
               <Input value={config.openai?.baseUrl} onChange={(value) => handleOpenAIChange('baseUrl', value)} />
@@ -608,14 +637,9 @@ const ModalMcpLibraryLinkSection: React.FC = () => {
     <div className='flex flex-col gap-12px min-h-0'>
       <div className='flex items-center justify-between gap-12px'>
         <div className='flex flex-col gap-4px'>
-          <span className='text-14px text-t-primary'>
-            {t('settings.mcpSettings', { defaultValue: 'MCP Servers' })}
-          </span>
+          <span className='text-14px text-t-primary'>{t('settings.mcpSettings', { defaultValue: 'MCP Servers' })}</span>
           <span className='text-13px text-t-secondary'>
-            {t(
-              'settings.mcpModalDeprecatedBody',
-              'Browse, install, and manage MCP servers in the new MCP Library.'
-            )}
+            {t('settings.mcpModalDeprecatedBody', 'Browse, install, and manage MCP servers in the new MCP Library.')}
           </span>
         </div>
         <Button type='outline' shape='round' onClick={handleOpenLibrary}>
@@ -645,22 +669,25 @@ const ToolsModalContent: React.FC = () => {
     ? (agentInstallStatus[builtinImageGenServer.name] ?? [])
     : [];
 
+  const navigate = useNavigate();
+  const handleOpenProvidersPage = useCallback(() => {
+    try {
+      navigate('/settings/models');
+    } catch {
+      if (typeof window !== 'undefined') {
+        window.location.hash = '#/settings/models';
+      }
+    }
+  }, [navigate]);
+
   const imageGenerationModelList = useMemo(() => {
     if (!data) return [];
-    // Filter models that support image generation
-    const isImageModel = (modelName: string) => {
-      const name = modelName.toLowerCase();
-      return name.includes('image') || name.includes('banana') || name.includes('imagine');
-    };
-    return (data || [])
-      .filter((v) => {
-        const filteredModels = v.model.filter(isImageModel);
-        return filteredModels.length > 0;
-      })
-      .map((v) => {
-        const filteredModels = v.model.filter(isImageModel);
-        return Object.assign({}, v, { model: filteredModels });
-      });
+    // Filter to providers exposing image-capable models, then float Flux to the
+    // top so its recommended "Flux Image" default leads the picker.
+    const list = (data || [])
+      .filter((v) => v.model.some(isImageModelName))
+      .map((v) => Object.assign({}, v, { model: v.model.filter(isImageModelName) }));
+    return list.toSorted((a, b) => Number(isFluxProviderRow(b)) - Number(isFluxProviderRow(a)));
   }, [data]);
 
   useEffect(() => {
@@ -903,10 +930,11 @@ const ToolsModalContent: React.FC = () => {
 
             <Divider className='mt-0px mb-20px' />
 
-            <Form layout='horizontal' labelAlign='left' className='space-y-12px'>
+            <Form layout='horizontal' labelAlign='left' className='space-y-12px wayland-stack-form-mobile'>
               <Form.Item label={t('settings.imageGenerationModel')}>
                 {imageGenerationModelList.length > 0 ? (
                   <WaylandSelect
+                    triggerProps={{ className: 'wl-image-model-popup' }}
                     value={
                       imageGenerationModel?.id && imageGenerationModel?.useModel
                         ? `${imageGenerationModel.id}|${imageGenerationModel.useModel}`
@@ -927,41 +955,44 @@ const ToolsModalContent: React.FC = () => {
                       <WaylandSelect.OptGroup label={platform.name} key={platform.id}>
                         {model.map((modelName) => (
                           <WaylandSelect.Option key={platform.id + modelName} value={platform.id + '|' + modelName}>
-                            {modelName}
+                            <span className='inline-flex items-center gap-6px'>
+                              {imageModelDisplayLabel(modelName)}
+                              {modelName === FLUX_RECOMMENDED_IMAGE_ID && (
+                                <span className='text-9px font-700 leading-none tracking-[0.05em] uppercase text-[rgb(var(--primary-6))] bg-[rgb(var(--primary-6)/0.12)] rd-5px px-6px py-2px'>
+                                  {t('settings.imageGenRecommended', 'Recommended')}
+                                </span>
+                              )}
+                            </span>
                           </WaylandSelect.Option>
                         ))}
                       </WaylandSelect.OptGroup>
                     ))}
                   </WaylandSelect>
                 ) : (
-                  <div className='text-t-secondary flex items-center'>
-                    {t('settings.noAvailable')}
-                    <Tooltip
-                      content={
-                        <div>
-                          {t('settings.needHelpTooltip')}
-                          <a
-                            href='https://github.com/FerroxLabs/wayland/wiki/Wayland-Image-Generation-Tool-Model-Configuration-Guide'
-                            target='_blank'
-                            rel='noopener noreferrer'
-                            className='text-[rgb(var(--primary-6))] hover:text-[rgb(var(--primary-5))] underline ml-4px'
-                            onClick={(e) => e.stopPropagation()}
-                          >
-                            {t('settings.configGuide')}
-                          </a>
-                        </div>
-                      }
+                  // No image-capable model connected (nothing installed, no key,
+                  // or only a CLI like Claude Code). Image generation stays
+                  // disabled until one is available - recommend Flux, mirroring
+                  // the models panel's Flux hero.
+                  <div className='rounded-12px bg-[var(--color-fill-2)] p-12px flex flex-col sm:flex-row sm:items-center sm:justify-between gap-12px'>
+                    <div className='min-w-0'>
+                      <div className='text-13px font-medium text-t-primary'>
+                        {t('settings.imageGenNoModelTitle', 'No image model connected')}
+                      </div>
+                      <div className='text-12px text-t-secondary'>
+                        {t(
+                          'settings.imageGenNoModelBody',
+                          'Connect Flux Router to generate images. One key, every model, and it picks the right one for each request.'
+                        )}
+                      </div>
+                    </div>
+                    <Button
+                      type='primary'
+                      size='small'
+                      className='w-full sm:w-auto shrink-0'
+                      onClick={handleOpenProvidersPage}
                     >
-                      <a
-                        href='https://github.com/FerroxLabs/wayland/wiki/Wayland-Image-Generation-Tool-Model-Configuration-Guide'
-                        target='_blank'
-                        rel='noopener noreferrer'
-                        className='ml-8px text-[rgb(var(--primary-6))] hover:text-[rgb(var(--primary-5))] cursor-pointer'
-                        onClick={(e) => e.stopPropagation()}
-                      >
-                        <HelpCircle size={14} />
-                      </a>
-                    </Tooltip>
+                      {t('settings.imageGenNoModelCta', 'Connect Flux')}
+                    </Button>
                   </div>
                 )}
               </Form.Item>

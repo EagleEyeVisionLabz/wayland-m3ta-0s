@@ -19,8 +19,30 @@ const AUTH_FAILURE_SIGNATURES = [
   '[acp-auth-',
   'oauth',
   'unauthorized',
-  '401',
+  // Engine-start credential failures (#629): the wcore engine bails during init
+  // with "No API key found" (engine config.rs) when it is spawned without a
+  // working key - the exact dead-end a paid user hit after a credit top-up left
+  // `model.apiKey` empty. Treat it as an auth failure so the recovery card
+  // (re-enter key / reconnect Flux) shows instead of a raw stderr bubble. The
+  // desktop's pre-spawn guard (MissingApiKeyError) also surfaces this phrasing.
+  'no api key',
+  'missingapikey',
+  'api key not found',
+  'no working provider',
+  // NOTE: bare '401' intentionally removed (#624) - a raw substring misroutes
+  // non-auth errors that merely contain "401"; HTTP_401_PATTERN (\b401\b) below
+  // handles the real status-code shapes with word boundaries.
 ] as const;
+
+/**
+ * HTTP 401 as a standalone status code. Matched with word boundaries rather
+ * than a bare `includes('401')` so an unrelated number that merely CONTAINS
+ * "401" - e.g. a token count like 40100, or an id like 124015 - does not
+ * misroute a non-auth error to the auth-failure card (#624). `\b401\b` still
+ * matches the real shapes: "401 Unauthorized", "error 401", "status=401",
+ * "HTTP/1.1 401".
+ */
+const HTTP_401_PATTERN = /\b401\b/;
 
 /** A descriptor for how to remedy an ACP auth failure for a given backend. */
 export type AcpAuthRemedy = {
@@ -42,12 +64,23 @@ export type AcpAuthRemedy = {
    * subscription fallback, so the generic "sign in to the CLI" copy is wrong.
    */
   explainerKey?: string;
+  /**
+   * True when the failing backend is ALREADY routed through Flux. Re-routing
+   * through Flux cannot fix it, so the card suppresses the Flux action.
+   */
+  fluxAlreadyRouted?: boolean;
+  /**
+   * True when the backend routes ANY provider (Wayland Core), so the "add a key"
+   * remedy must read generically ("add any provider API key") rather than naming
+   * one vendor.
+   */
+  genericProviderKey?: boolean;
 };
 
 /** Case-insensitive substring match against the generic auth-failure signatures. */
 export function looksLikeAuthFailure(errorMsg: string): boolean {
   const haystack = errorMsg.toLowerCase();
-  return AUTH_FAILURE_SIGNATURES.some((signature) => haystack.includes(signature));
+  return AUTH_FAILURE_SIGNATURES.some((signature) => haystack.includes(signature)) || HTTP_401_PATTERN.test(haystack);
 }
 
 /** Display labels for backend ids that do not Title-case cleanly. */
@@ -81,6 +114,13 @@ const BACKEND_REMEDIES: Record<string, Partial<AcpAuthRemedy>> = {
     cliLoginCmd: 'codex login',
     fluxRoutable: true,
   },
+  grok: {
+    backendLabel: 'Grok Build',
+    // Auth is the grok.com OAuth login behind a SuperGrok subscription; the only
+    // fix is re-running the CLI login. Not Flux-routable (xAI's own gateway).
+    cliLoginCmd: 'grok login',
+    fluxRoutable: false,
+  },
   qwen: {
     backendLabel: 'Qwen Code',
     cliLoginCmd: 'qwen',
@@ -99,6 +139,8 @@ const BACKEND_REMEDIES: Record<string, Partial<AcpAuthRemedy>> = {
   wcore: {
     backendLabel: 'Wayland Core',
     fluxRoutable: true,
+    // Wayland Core routes any provider, so the add-key remedy is vendor-neutral.
+    genericProviderKey: true,
     // No CLI login and no subscription fallback - the only fixes are a working
     // provider key or the Flux route. Keep cliLoginCmd undefined so buildRemedy
     // does not synthesize a "wcore login" command.
@@ -112,7 +154,7 @@ function buildRemedy(backend: string, runtimeOverrides?: Partial<AcpAuthRemedy>)
   const override = BACKEND_REMEDIES[backend] ?? {};
   const backendLabel =
     override.backendLabel ?? BACKEND_LABELS[backend] ?? backend.charAt(0).toUpperCase() + backend.slice(1);
-  return {
+  const remedy: AcpAuthRemedy = {
     backend,
     backendLabel,
     subscriptionOAuthBlocked: override.subscriptionOAuthBlocked ?? false,
@@ -120,8 +162,13 @@ function buildRemedy(backend: string, runtimeOverrides?: Partial<AcpAuthRemedy>)
     cliLoginCmd: 'cliLoginCmd' in override ? override.cliLoginCmd : `${backend} login`,
     fluxRoutable: override.fluxRoutable ?? false,
     explainerKey: override.explainerKey,
+    genericProviderKey: override.genericProviderKey,
     ...runtimeOverrides,
   };
+  // A backend already routed through Flux cannot be fixed by routing through
+  // Flux again - hide that action so the user picks a real remedy.
+  if (remedy.fluxAlreadyRouted) remedy.fluxRoutable = false;
+  return remedy;
 }
 
 /**

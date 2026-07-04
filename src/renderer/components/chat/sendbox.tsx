@@ -7,10 +7,12 @@
 import { ipcBridge } from '@/common';
 import AtFileMenu from '@/renderer/components/chat/AtFileMenu';
 import BtwOverlay from '@/renderer/components/chat/BtwOverlay';
+import DoctorReportModal from '@/renderer/components/chat/DoctorReportModal';
 import { useInputFocusRing } from '@/renderer/hooks/chat/useInputFocusRing';
 import SlashCommandMenu, { type SlashCommandMenuItem } from '@/renderer/components/chat/SlashCommandMenu';
 import { useBtwCommand } from '@/renderer/components/chat/BtwOverlay/useBtwCommand';
 import { useSlashCommandController } from '@/renderer/hooks/chat/useSlashCommandController';
+import { useUserSlashCommands } from '@/renderer/hooks/chat/useUserSlashCommands';
 import { useLayoutContext } from '@/renderer/hooks/context/LayoutContext';
 import { useConversationContextSafe } from '@/renderer/hooks/context/ConversationContext';
 import { usePreviewContext } from '@/renderer/pages/conversation/Preview';
@@ -21,6 +23,7 @@ import { mergeFileSelectionItems, type FileSelectionItem } from '@/renderer/util
 import type { FileOrFolderItem } from '@/renderer/utils/file/fileTypes';
 import { filterWorkspaceMentionItems } from '@/renderer/utils/file/workspaceMentions';
 import { copyText } from '@/renderer/utils/ui/clipboard';
+import { isElectronDesktop } from '@/renderer/utils/platform';
 import { blurActiveElement, shouldBlockMobileInputFocus } from '@/renderer/utils/ui/focus';
 import { Button, Input, Message, Tag } from '@arco-design/web-react';
 import { ArrowUp, Quote, X } from 'lucide-react';
@@ -223,6 +226,7 @@ const SendBox: React.FC<{
   const [workspaceMentionLoading, setWorkspaceMentionLoading] = useState(false);
   const [atFileMenuActiveIndex, setAtFileMenuActiveIndex] = useState(0);
   const [dismissedAtFileToken, setDismissedAtFileToken] = useState<string | null>(null);
+  const [isDoctorModalOpen, setIsDoctorModalOpen] = useState(false);
   const mentionOwnedPathsRef = useRef<Set<string>>(new Set());
   const everMentionOwnedPathsRef = useRef<Set<string>>(new Set());
   const externalOwnedPathsRef = useRef<Set<string>>(new Set());
@@ -422,13 +426,58 @@ const SendBox: React.FC<{
         source: 'builtin',
       });
     }
+    // App-wide diagnostic, handled inline (opens a modal). Desktop-only: the
+    // `doctor.run` IPC is in REMOTE_DENIED_KEYS, so a paired-WebUI/remote session
+    // would open the modal only to have the run dropped ("Could not run the
+    // Doctor"). Gate the command on the local Electron desktop so it's never a
+    // dead affordance remotely.
+    if (isElectronDesktop()) {
+      commands.push({
+        name: 'doctor',
+        description: t('messages.doctor.commandDescription', { defaultValue: 'Run a health check on your setup' }),
+        kind: 'builtin',
+        source: 'builtin',
+      });
+    }
     return commands;
   }, [conversationContext?.conversationId, enableBtw, onSlashBuiltinCommand, t]);
+
+  const { commands: userSlashCommands } = useUserSlashCommands();
+
+  // User-defined commands mapped into the shared SlashCommandItem shape with a
+  // "Custom" badge so they're distinguishable from agent/builtin commands.
+  const userSlashCommandItems = useMemo<SlashCommandItem[]>(
+    () =>
+      userSlashCommands.map((command) => ({
+        name: command.name,
+        description: command.description,
+        kind: 'template',
+        source: 'user',
+        hint: t('messages.slash.customBadge', { defaultValue: 'Custom' }),
+      })),
+    [userSlashCommands, t]
+  );
+
+  // Template bodies keyed by command name, for expansion on select.
+  const userTemplateByName = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const command of userSlashCommands) {
+      map.set(command.name, command.template);
+    }
+    return map;
+  }, [userSlashCommands]);
 
   const mergedSlashCommands = useMemo(() => {
     const map = new Map<string, SlashCommandItem>();
     for (const command of builtinSlashCommands) {
       map.set(command.name, command);
+    }
+    // User commands take precedence over agent commands of the same name (the
+    // user explicitly authored them) but never over builtins.
+    for (const command of userSlashCommandItems) {
+      if (!map.has(command.name)) {
+        map.set(command.name, command);
+      }
     }
     for (const command of slashCommands) {
       if (!map.has(command.name)) {
@@ -436,7 +485,7 @@ const SendBox: React.FC<{
       }
     }
     return Array.from(map.values());
-  }, [builtinSlashCommands, slashCommands]);
+  }, [builtinSlashCommands, userSlashCommandItems, slashCommands]);
 
   const slashController = useSlashCommandController({
     input,
@@ -457,6 +506,8 @@ const SendBox: React.FC<{
         }
       } else if (name === 'export') {
         void conversationExport.openExportFlow();
+      } else if (name === 'doctor') {
+        setIsDoctorModalOpen(true);
       } else {
         onSlashBuiltinCommand?.(name);
       }
@@ -464,6 +515,13 @@ const SendBox: React.FC<{
     },
     onSelectTemplate: (name) => {
       setInput(`/${name} `);
+    },
+    onSelectUserCommand: (name) => {
+      // v1 UX: expand the template body into the composer with any `{arg}` /
+      // `{{arg}}` placeholders left in place for the user to fill before
+      // sending. No interactive arg-collection step in v1 (see issue #28).
+      const template = userTemplateByName.get(name);
+      setInput(template ?? `/${name} `);
     },
   });
 
@@ -1272,6 +1330,17 @@ const SendBox: React.FC<{
     ></Button>
   );
 
+  // Visible "the agent is still working" indicator. Keys off the same
+  // running/processing flag that decides whether the Stop button shows, so it
+  // stays in lockstep across every platform that renders this shared SendBox.
+  const isRunning = isLoading || loading;
+  const runningIndicator = isRunning ? (
+    <span className='sendbox-running' role='status' aria-live='polite'>
+      <span className='sendbox-running-dot' aria-hidden='true' />
+      {t('messages.working', { defaultValue: 'Working...' })}
+    </span>
+  ) : null;
+
   const renderActionButtons = () => {
     if (allowSendWhileLoading && (isLoading || loading)) {
       // Keep a single action slot while processing: show stop when the draft is empty,
@@ -1361,6 +1430,7 @@ const SendBox: React.FC<{
           parentTaskRunning={Boolean(loading || isLoading)}
           question={btwCommand.question}
         />
+        <DoctorReportModal visible={isDoctorModalOpen} onClose={() => setIsDoctorModalOpen(false)} />
         {isAtFileMenuOpen && (
           <div className='absolute left-12px right-12px bottom-[calc(100%+8px)] z-70'>
             <AtFileMenu
@@ -1563,6 +1633,7 @@ const SendBox: React.FC<{
           </div>
           {isSingleLine && (
             <div className='flex items-center gap-2'>
+              {runningIndicator}
               <SpeechInputButton
                 disabled={disabled || isLoading || loading || isUploading}
                 locale={speechLocale}
@@ -1577,6 +1648,7 @@ const SendBox: React.FC<{
           <div className='flex items-center justify-between gap-2 w-full'>
             <div className={isMobile ? 'sendbox-tools sendbox-tools-scroll-mobile' : 'sendbox-tools'}>{tools}</div>
             <div className='flex items-center gap-2'>
+              {runningIndicator}
               <SpeechInputButton
                 disabled={disabled || isLoading || loading || isUploading}
                 locale={speechLocale}

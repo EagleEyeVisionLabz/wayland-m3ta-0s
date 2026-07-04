@@ -12,6 +12,15 @@ import ContextUsageIndicator from '@/renderer/components/agent/ContextUsageIndic
 import CommandQueuePanel from '@/renderer/components/chat/CommandQueuePanel';
 import SendBox from '@/renderer/components/chat/sendbox';
 import ThoughtDisplay from '@/renderer/components/chat/ThoughtDisplay';
+import {
+  CHAT_CONTINUE_EVENT,
+  CHAT_RETRY_EVENT,
+  CONTINUE_DIRECTIVE,
+  EDIT_AND_RERUN_EVENT,
+  type ChatContinueDetail,
+  type ChatRetryDetail,
+  type ChatEditRerunDetail,
+} from '@/renderer/pages/conversation/Messages/components/MessageActions';
 import FileAttachButton from '@/renderer/components/media/FileAttachButton';
 import FilePreview from '@/renderer/components/media/FilePreview';
 import HorizontalFileList from '@/renderer/components/media/HorizontalFileList';
@@ -23,7 +32,11 @@ import { usePendingSendOnWake } from '@/renderer/hooks/chat/usePendingSendOnWake
 import { useOpenFileSelector } from '@/renderer/hooks/file/useOpenFileSelector';
 import { useProviderReadiness } from '@/renderer/hooks/useProviderReadiness';
 import { useLatestRef } from '@/renderer/hooks/ui/useLatestRef';
-import { useAddOrUpdateMessage, useRemoveMessageByMsgId } from '@/renderer/pages/conversation/Messages/hooks';
+import {
+  useAddOrUpdateMessage,
+  useRemoveMessageByMsgId,
+  useTruncateMessagesAfter,
+} from '@/renderer/pages/conversation/Messages/hooks';
 import { assertBridgeSuccess } from '@/renderer/pages/conversation/platforms/assertBridgeSuccess';
 import {
   shouldEnqueueConversationCommand,
@@ -39,12 +52,14 @@ import { buildDisplayMessage, collectSelectedFiles } from '@/renderer/utils/file
 import { mergeWithCapabilities, type AgentModeOption } from '@/renderer/utils/model/agentModes';
 import { getModelContextLimit } from '@/renderer/utils/model/modelContextLimits';
 import { Message, Tag } from '@arco-design/web-react';
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useWCoreMessage } from './useWCoreMessage';
 import type { WCoreModelSelection } from './useWCoreModelSelection';
 import type { IResponseMessage } from '@/common/adapter/ipcBridge';
 import { classifyAcpAuthFailure } from '@/renderer/pages/conversation/platforms/acp/acpAuthFailure';
+import { isContextCeilingErrorMessage } from '@/renderer/utils/model/errorDetection';
+import { isFluxModelId } from '@/common/config/flux';
 
 const useWCoreSendBoxDraft = getSendBoxDraftHook('wcore', {
   _type: 'wcore',
@@ -95,9 +110,15 @@ const WCoreSendBox: React.FC<{
   teamId?: string;
   agentSlotId?: string;
   sessionMode?: string;
-}> = ({ conversation_id, modelSelection, teamId, agentSlotId, sessionMode }) => {
+  /** Report the turn-running state up so the inline orbit indicator can render in the message list. */
+  onRunningChange?: (running: boolean) => void;
+}> = ({ conversation_id, modelSelection, teamId, agentSlotId, sessionMode, onRunningChange }) => {
   const [workspacePath, setWorkspacePath] = useState('');
   const [dynamicModes, setDynamicModes] = useState<AgentModeOption[]>([]);
+  // The most recent turn dispatched, kept so the Flux failover can replay it.
+  // WCore's 401 arrives asynchronously via the stream (onError), where the
+  // original input is no longer in scope - so we stash it at send time.
+  const lastSentRef = useRef<{ input: string; files: string[]; msg_id: string } | null>(null);
   const { t } = useTranslation();
   const { checkAndUpdateTitle } = useAutoTitle();
   const { currentModel, getDisplayModelName } = modelSelection;
@@ -107,17 +128,36 @@ const WCoreSendBox: React.FC<{
   // the main process and auto-fires once a provider wakes the engine (WS-4).
   const engineAsleep = !readiness.ready && !readiness.loading;
 
-  // When the engine surfaces a provider auth failure (e.g. 401 / invalid
-  // x-api-key on a dead key), show the same remedy card the ACP backends use.
-  // The main process separately flips that provider off "connected".
-  const handleAuthError = useCallback(
+  // When the engine surfaces a terminal turn error, route it to the matching
+  // in-thread remedy card so the user gets a one-click fix instead of a raw
+  // dead-end. Two cases are handled: a provider auth failure (401 / invalid
+  // x-api-key — same card the ACP backends use; the main process separately
+  // flips that provider off "connected"), and a context-window-ceiling stop
+  // (#615), where the fix is to switch to a larger-context model and retry.
+  const handleTurnError = useCallback(
     (message: IResponseMessage) => {
       const text = typeof message.data === 'string' ? message.data : String(message.data ?? '');
       if (classifyAcpAuthFailure('wcore', text)) {
-        emitter.emit('wcore.auth.failed.card', { conversation_id, providerLabel: currentModel?.name });
+        emitter.emit('wcore.auth.failed.card', {
+          conversation_id,
+          providerLabel: currentModel?.name,
+          pendingInput: lastSentRef.current?.input,
+          pendingFiles: lastSentRef.current?.files,
+          fluxAlreadyRouted: isFluxModelId(currentModel?.useModel),
+        });
+        return;
+      }
+      if (isContextCeilingErrorMessage(text)) {
+        emitter.emit('wcore.context.ceiling.card', {
+          conversation_id,
+          model: currentModel?.useModel ? getDisplayModelName(currentModel.useModel) : currentModel?.name,
+          rawError: text,
+          pendingInput: lastSentRef.current?.input,
+          pendingFiles: lastSentRef.current?.files,
+        });
       }
     },
-    [conversation_id, currentModel?.name]
+    [conversation_id, currentModel?.name, currentModel?.useModel, getDisplayModelName]
   );
 
   const { thought, running, hasHydratedRunningState, tokenUsage, setActiveMsgId, setWaitingResponse, resetState } =
@@ -127,8 +167,12 @@ const WCoreSendBox: React.FC<{
         if (modes && modes.length > 0) {
           setDynamicModes(mergeWithCapabilities('wcore', modes));
         }
+        // #466: surface Computer-Use availability so WCoreChat can prime the
+        // macOS permission card only when the agent actually has CUA.
+        const hasCua = Boolean((capabilities as { computer_use?: boolean })?.computer_use);
+        emitter.emit('wcore.cua.capability', { conversation_id, hasCua });
       },
-      onError: handleAuthError,
+      onError: handleTurnError,
     });
 
   const { atPath, uploadFile, setAtPath, setUploadFile, content, setContent } = useSendBoxDraft(conversation_id);
@@ -144,6 +188,7 @@ const WCoreSendBox: React.FC<{
 
   const addOrUpdateMessage = useAddOrUpdateMessage();
   const removeMessageByMsgId = useRemoveMessageByMsgId();
+  const truncateMessagesAfter = useTruncateMessagesAfter();
   const { setSendBoxHandler } = usePreviewContext();
   const isBusy = running;
 
@@ -184,6 +229,7 @@ const WCoreSendBox: React.FC<{
       }
 
       const msg_id = uuid();
+      lastSentRef.current = { input, files, msg_id };
       setActiveMsgId(msg_id);
       setWaitingResponse(true);
 
@@ -346,6 +392,68 @@ const WCoreSendBox: React.FC<{
     await executeCommand({ input: message, files: filesToSend });
   };
 
+  // #252 rework: Retry on a message's action row re-sends that turn's prompt.
+  // The active sendbox owns send, so it listens for the window event (scoped to
+  // this conversation so it never fires on another open tab).
+  const onSendRef = useRef(onSendHandler);
+  onSendRef.current = onSendHandler;
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent<ChatRetryDetail>).detail;
+      if (!detail?.text) return;
+      if (detail.conversationId && detail.conversationId !== conversation_id) return;
+      void onSendRef.current(detail.text);
+    };
+    window.addEventListener(CHAT_RETRY_EVENT, handler);
+    return () => window.removeEventListener(CHAT_RETRY_EVENT, handler);
+  }, [conversation_id]);
+
+  // #457 True Continue: resume the live turn instead of restarting it. Unlike
+  // Retry (which re-sends the original prompt), Continue sends a fixed
+  // continuation DIRECTIVE into the SAME conversation - the engine still holds
+  // the transcript, so it picks up from the partial work rather than redoing it.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent<ChatContinueDetail>).detail;
+      // Scope strictly to THIS conversation. An id-less event must not fan out
+      // into every mounted sendbox (multi-tab), so a missing id is dropped too -
+      // the banner always dispatches with the conversation id.
+      if (!detail?.conversationId || detail.conversationId !== conversation_id) return;
+      void onSendRef.current(CONTINUE_DIRECTIVE);
+    };
+    window.addEventListener(CHAT_CONTINUE_EVENT, handler);
+    return () => window.removeEventListener(CHAT_CONTINUE_EVENT, handler);
+  }, [conversation_id]);
+
+  // Edit-and-rerun: truncate messages after the edited user message, then re-send.
+  const truncateRef = useRef(truncateMessagesAfter);
+  truncateRef.current = truncateMessagesAfter;
+  useEffect(() => {
+    const handler = async (e: Event) => {
+      const detail = (e as CustomEvent<ChatEditRerunDetail>).detail;
+      if (!detail?.text || !detail.conversationId || detail.afterTimestamp == null) return;
+      if (detail.conversationId !== conversation_id) return;
+      const result = await ipcBridge.conversation.deleteMessagesAfter.invoke({
+        conversation_id: detail.conversationId,
+        afterTimestamp: detail.afterTimestamp,
+      });
+      if (!result?.success) {
+        console.error('[WCoreSendBox] deleteMessagesAfter failed', result);
+      }
+      truncateRef.current(detail.afterTimestamp);
+      void onSendRef.current(detail.text);
+    };
+    window.addEventListener(EDIT_AND_RERUN_EVENT, handler);
+    return () => window.removeEventListener(EDIT_AND_RERUN_EVENT, handler);
+  }, [conversation_id]);
+
+  // Report the turn-running state up so the inline orbit "thinking" indicator
+  // (rendered in the message list, under the last block) shows the moment a turn
+  // starts and hides when it completes.
+  useEffect(() => {
+    onRunningChange?.(running);
+  }, [running, onRunningChange]);
+
   const handleEditQueuedCommand = useCallback(
     (item: ConversationCommandQueueItem) => {
       remove(item.id);
@@ -375,6 +483,34 @@ const WCoreSendBox: React.FC<{
     }
   });
 
+  // Flux failover replay: WCoreChat re-routes the dead chat through Flux, then
+  // asks the send box to re-run the failed turn. Drop the original failed bubble
+  // first so the retry does not duplicate it.
+  useAddEventListener(
+    'wcore.flux.replay',
+    (p) => {
+      if (p.conversation_id !== conversation_id) return;
+      const last = lastSentRef.current;
+      if (last?.msg_id) removeMessageByMsgId(last.msg_id);
+      void executeCommand({ input: p.input, files: p.files });
+    },
+    [conversation_id, executeCommand, removeMessageByMsgId]
+  );
+
+  // Context-ceiling retry (#615): WCoreChat re-runs the failed turn once the user
+  // has switched to a larger-context model. Mirrors the Flux replay above — drop
+  // the original failed bubble first so the retry does not duplicate it.
+  useAddEventListener(
+    'wcore.context.retry',
+    (p) => {
+      if (p.conversation_id !== conversation_id) return;
+      const last = lastSentRef.current;
+      if (last?.msg_id) removeMessageByMsgId(last.msg_id);
+      void executeCommand({ input: p.input, files: p.files });
+    },
+    [conversation_id, executeCommand, removeMessageByMsgId]
+  );
+
   // Stop conversation handler
   const handleStop = async (): Promise<void> => {
     try {
@@ -400,7 +536,11 @@ const WCoreSendBox: React.FC<{
         onRemove={remove}
         onClear={clear}
       />
-      <ThoughtDisplay thought={thought} running={running} onStop={handleStop} />
+      {/* #252 rework: the orbit "thinking" indicator moved INTO the message list
+          (inline, under the last block - Claude-style), driven by onRunningChange.
+          ThoughtDisplay is kept for the thought-subject hint path (e.g.
+          "Awaiting Confirmation"), which renders null otherwise. */}
+      <ThoughtDisplay thought={thought} onStop={handleStop} />
 
       <SendBox
         value={content}

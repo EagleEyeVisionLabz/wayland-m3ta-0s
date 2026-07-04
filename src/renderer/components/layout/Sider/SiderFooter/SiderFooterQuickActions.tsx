@@ -18,6 +18,7 @@ import { Bug, Globe, Star } from 'lucide-react';
 import { Tooltip } from '@arco-design/web-react';
 import { webui } from '@/common/adapter/ipcBridge';
 import { openExternalUrl } from '@/renderer/utils/platform';
+import { fileBugReport } from '@/renderer/utils/bugReport';
 import classNames from 'classnames';
 import styles from './SiderFooterQuickActions.module.css';
 
@@ -26,7 +27,7 @@ type WebuiQuickStatus = 'checking' | 'running' | 'stopped' | 'error';
 const GITHUB_REPO_URL = 'https://github.com/FerroxLabs/wayland';
 
 export interface SiderFooterQuickActionsProps {
-  /** Optional bug-report opener. If omitted, the button is rendered but inert (v0.6.2). */
+  /** Optional bug-report opener. If omitted, the button opens the GitHub issue chooser. */
   onOpenBugReport?: () => void;
   /** Optional external-link opener. Defaults to window.open. */
   onOpenLink?: (url: string) => void;
@@ -41,6 +42,7 @@ export const SiderFooterQuickActions: React.FC<SiderFooterQuickActionsProps> = (
   const { t } = useTranslation();
   const navigate = useNavigate();
   const [webuiStatus, setWebuiStatus] = useState<WebuiQuickStatus>('checking');
+  const [bugReportBusy, setBugReportBusy] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -85,8 +87,17 @@ export const SiderFooterQuickActions: React.FC<SiderFooterQuickActionsProps> = (
   }, [onOpenLink]);
 
   const handleOpenBug = useCallback(() => {
-    onOpenBugReport?.();
-  }, [onOpenBugReport]);
+    if (onOpenBugReport) {
+      onOpenBugReport();
+      return;
+    }
+    if (bugReportBusy) return;
+    // One-click detailed bug report (#464): capture the app window, copy it to the
+    // clipboard, and open a GitHub issue pre-filled with diagnostics + versions.
+    // `fileBugReport` never throws and falls back to the template chooser on error.
+    setBugReportBusy(true);
+    void fileBugReport(t).finally(() => setBugReportBusy(false));
+  }, [onOpenBugReport, bugReportBusy, t]);
 
   const webuiTitle = t('settings.webui', { defaultValue: 'WebUI' });
   const bugTitle = t('conversation.welcome.quickActionFeedback', { defaultValue: 'Send feedback' });
@@ -101,6 +112,8 @@ export const SiderFooterQuickActions: React.FC<SiderFooterQuickActionsProps> = (
           aria-label={bugTitle}
           title={bugTitle}
           onClick={handleOpenBug}
+          disabled={bugReportBusy}
+          aria-busy={bugReportBusy}
           data-testid='sider-footer-quick-bug'
         >
           <Bug size={16} />

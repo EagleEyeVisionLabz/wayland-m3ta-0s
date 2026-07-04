@@ -178,21 +178,27 @@ const REMOTE_DENIED_KEYS: ReadonlySet<string> = new Set([
   'write-assistant-skill',
   'import-skill',
   'skills.build.draft',
+  'skills.confirm-import',
   'skills.import.folder',
   'skills.import.git',
   'skills.import.single-skill-md',
   'skills.import.zip',
   'skills.rescan-all',
   'skills.scan',
+  'skills.scan-library',
   'skills.set-pinned',
-  // --- Model registry secret/write IPC (audit C4). `resolveForChatStart`
-  //     returns a DECRYPTED plaintext provider key; connect/rekey/detectKeys
-  //     mutate or disclose stored credentials. A paired WebUI must never reach
-  //     these or it can harvest every stored provider key. ---
+  // --- Model registry secret/write IPC. connect/rekey/detectKeys mutate or
+  //     disclose stored credentials, so a paired WebUI must never reach them.
+  //     `resolveForChatStart` is deliberately NOT denied here: audit C4 hardened
+  //     it to return ONLY a non-secret chat-start handle (id / platform /
+  //     modelId / baseUrl) - the decrypted key is dropped and re-resolved in the
+  //     main process at spawn, never crossing IPC (proven by the
+  //     "never returns decrypted secrets" handler test). A remote/headless WebUI
+  //     MUST reach it to bind a chat to a model; denying it left every remote
+  //     model pick unresolved ("No model configured yet" - cannot chat). ---
   'modelRegistry.connect',
   'modelRegistry.rekey',
   'modelRegistry.detectKeys',
-  'modelRegistry.resolveForChatStart',
   // --- Wayland Core tool-backend key mutation (plant/clear a search API key) ---
   'wcoreToolKeys.set',
   'wcoreToolKeys.delete',
@@ -203,6 +209,35 @@ const REMOTE_DENIED_KEYS: ReadonlySet<string> = new Set([
   // Also deny the read: it discloses the engine's security/tools posture to a
   // paired WebUI client (no secret values, but defence-in-depth — SEC review F2).
   'wcoreConfig.getSection',
+  // --- Cron write/exec surface. A cron job carries `agentConfig.mode`, which the
+  //     executor applies via `task.setMode()` at run time. With the bundled
+  //     engine now honoring a wire `set_mode` (WAYLAND_ALLOW_WIRE_FORCE, #495), a
+  //     remote-authored job with mode `yolo`/`force`/`auto_edit`/`bypassPermissions`
+  //     would spawn a Force/AutoEdit-mode agent with NO local user action. There
+  //     is no per-call remote/local signal inside a buildProvider handler (remote
+  //     enforcement is name-based here), so mode cannot be clamped in-handler;
+  //     deny the write/exec surface outright, mirroring `wcoreConfig.setSection`.
+  //     add-job/update-job set the mode; run-now fires the agent (exec);
+  //     save-skill writes the job's SKILL.md verbatim (validated only for YAML
+  //     frontmatter shape, NOT instruction content), so a remote caller could
+  //     plant arbitrary agent instructions that the next scheduled fire runs
+  //     with exec capability — deny it too; confirm-proposal accepts a pending
+  //     cron proposal (creates a real job) and leaks its edit payload. The
+  //     read-only views (cron.list-jobs / list-jobs-by-conversation / get-job /
+  //     has-skill) and cron.remove-job stay allowed for the paired UI. Tradeoff:
+  //     remote devices can no longer create/update, plant skills for, accept
+  //     proposals for, or manually trigger cron jobs; scheduled jobs still fire
+  //     and local creation is unaffected. ---
+  'cron.add-job',
+  'cron.update-job',
+  'cron.run-now',
+  'cron.save-skill',
+  'cron.confirm-proposal',
+  // --- In-app engine updater. `install` downloads + stages a native binary the
+  //     next engine spawn executes; a remote caller reaching it is an RCE chain.
+  //     `check` hits the network + discloses the engine version. HUMAN-only. ---
+  'wcoreUpdate.check',
+  'wcoreUpdate.install',
   // --- Wayland Core profile fs mutation (create/clone/activate/delete profile
   //     directories under the profiles root). Remote-denied (SEC-4). ---
   'wcoreProfiles.create',
@@ -235,6 +270,12 @@ const REMOTE_DENIED_KEYS: ReadonlySet<string> = new Set([
   //     allowed. ---
   'channel.enable-plugin',
   'channel.disable-plugin',
+  // Discloses a channel's saved connection details (IMAP/SMTP hosts + the
+  // account address). Same disclosure threat class as the config mutators
+  // above, so a paired WebUI must not read it back. Secrets are already reduced
+  // to presence flags in the handler, but the non-secret host/address fields
+  // still warrant deny for remote callers.
+  'channel.get-plugin-config',
   'channel.rotate-webhook-token',
   'channel.sync-channel-settings',
   'channel.revoke-user',
@@ -268,6 +309,19 @@ const REMOTE_DENIED_KEYS: ReadonlySet<string> = new Set([
   //     stays allowed. ---
   'onboarding.connect-pasted-key',
   'onboarding.connect-flux',
+  // --- Native xAI "Sign in with X (Grok)" OAuth. Both mint/persist the `xai`
+  //     provider credential via the model-registry connect path - same class as
+  //     connect-flux above. A remote WS caller must never drive an OAuth mint or
+  //     trigger a refresh-token exchange. ---
+  'xai.auth.login',
+  'xai.auth.refresh',
+  'xai.auth.submit-code',
+  // --- Native "Sign in with ChatGPT" OAuth. Both mint/persist the
+  //     `chatgpt-subscription` provider bundle (refresh + access tokens) via the
+  //     OAuth flow - same credential-minting class as xai.auth.* above. A remote
+  //     WS caller must never drive an OAuth mint or a refresh-token exchange. ---
+  'chatgpt.auth.login',
+  'chatgpt.auth.refresh',
   // --- Cost observability (WS-D / WS-F). The whole cost.* namespace is already
   //     denied to remote callers via the `cost.` prefix above; these exact keys
   //     are enumerated for documentation + defence-in-depth. byConversation +
@@ -283,8 +337,19 @@ const REMOTE_DENIED_KEYS: ReadonlySet<string> = new Set([
   'mcp.sync-to-agents',
   'mcp.remove-from-agents',
   'mcp.login-oauth',
+  'mcp.cancel-oauth',
   'mcp.logout-oauth',
   'mcp.set-byo-oauth-credentials',
+  // --- Memory mutation (#414 edit/delete of the user's local memory files) ---
+  //     The memory.* namespace is intentionally open to the paired WebUI for
+  //     READS (list/get/projects/tags/stats). These two providers perform a
+  //     real, hard, unrecoverable rewrite/delete of an on-disk memory block, so
+  //     a remote/paired peer must never reach them: update-entry silently
+  //     rewrites a block, delete-entry hard-deletes it (atomic rename/unlink,
+  //     no recycle). Reads stay allowed; only the destructive mutations are
+  //     denied to remote. (Local Electron IPC never passes through this gate.)
+  'memory.update-entry',
+  'memory.delete-entry',
   // --- Project knowledge draft (reads arbitrary filePaths to feed the model) ---
   'project.generate-knowledge-draft',
   // --- Storage destructive / disk operations ---
@@ -302,6 +367,16 @@ const REMOTE_DENIED_KEYS: ReadonlySet<string> = new Set([
   'open-file',
   'open-dev-tools',
   'show-item-in-folder',
+  // --- Doctor / health-check (issue #35). The report enumerates the host's
+  //     provider connectivity verdicts, MCP server reachability, detected
+  //     backends, workspace paths, and config posture. None of it is a raw
+  //     secret, but disclosing the full diagnostic posture to a paired WebUI is
+  //     a reconnaissance aid — deny it to remote callers (defence-in-depth).
+  //     `doctor.copy-text` writes caller-supplied text to the host's OS
+  //     clipboard from MAIN (Electron `clipboard.writeText`); a remote caller
+  //     reaching it is a clipboard-injection primitive, so deny it too. ---
+  'doctor.run',
+  'doctor.copy-text',
 ]);
 
 /**

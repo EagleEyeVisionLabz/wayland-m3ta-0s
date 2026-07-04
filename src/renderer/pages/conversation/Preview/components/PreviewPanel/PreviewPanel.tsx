@@ -12,6 +12,7 @@ import { usePreviewContext } from '../../context/PreviewContext';
 import { useResizableSplit } from '@/renderer/hooks/ui/useResizableSplit';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useEditorSettings } from '@renderer/hooks/settings/useEditorSettings';
+import { ErrorBoundary } from '@/renderer/components/ErrorBoundary';
 import CodePreview from '../viewers/CodeViewer';
 import DiffPreview from '../viewers/DiffViewer';
 import ExcelPreview from '../viewers/ExcelViewer';
@@ -37,6 +38,7 @@ import {
   type PreviewTab,
 } from '.';
 import { DEFAULT_SPLIT_RATIO, FILE_TYPES_WITH_BUILTIN_OPEN, MAX_SPLIT_WIDTH, MIN_SPLIT_WIDTH } from '../../constants';
+import { resolveOpenInSystemToast } from '../../fileUtils';
 import {
   usePreviewHistory,
   usePreviewKeyboardShortcuts,
@@ -434,10 +436,17 @@ const PreviewPanel: React.FC = () => {
     }
 
     try {
-      // Open file with system default application
-      await ipcBridge.shell.openFile.invoke(metadata.filePath);
+      // Open file with system default application. #621: openFile resolves to
+      // { ok, error? } (#616 contract) and does NOT throw on a failed shell
+      // open (e.g. no Linux xdg association), so gate the toast on `ok` (see
+      // resolveOpenInSystemToast) instead of an unconditional success.
+      const result = await ipcBridge.shell.openFile.invoke(metadata.filePath);
+      const toast = resolveOpenInSystemToast(result, {
+        success: t('preview.openInSystemSuccess'),
+        failed: t('preview.openInSystemFailed'),
+      });
       try {
-        messageApi.success(t('preview.openInSystemSuccess'));
+        messageApi[toast.kind](toast.message);
       } catch {
         // Context holder may be unmounted after async operation
       }
@@ -805,8 +814,34 @@ const PreviewPanel: React.FC = () => {
           />
         )}
 
-        {/* Preview content */}
-        {renderContent()}
+        {/* Preview content — contained in its own boundary so a viewer crash
+            (e.g. a syntax-highlighter dynamic-import / "module" error on a
+            packaged Windows build, #253) degrades to an inline message instead
+            of unmounting the whole conversation route, which also broke the
+            back button (#254). */}
+        <ErrorBoundary
+          key={metadata?.filePath ?? metadata?.title}
+          fallback={(_error, reset) => (
+            <div className='flex flex-col flex-1 items-center justify-center gap-12px p-24px text-center'>
+              <div className='text-text-2 font-medium'>
+                {t('preview.viewerError.title', { defaultValue: "This file couldn't be opened" })}
+              </div>
+              <div className='text-text-3 text-12px max-w-360px'>
+                {t('preview.viewerError.detail', {
+                  defaultValue: 'The viewer hit an unexpected error. Try again, or open the file in your system app.',
+                })}
+              </div>
+              <div
+                className='flex items-center gap-4px px-12px py-6px rd-4px cursor-pointer bg-primary text-white hover:opacity-85 transition-opacity'
+                onClick={reset}
+              >
+                {t('preview.viewerError.retry', { defaultValue: 'Try again' })}
+              </div>
+            </div>
+          )}
+        >
+          {renderContent()}
+        </ErrorBoundary>
 
         {/* Tab context menu */}
         {/* eslint-disable-next-line max-len */}

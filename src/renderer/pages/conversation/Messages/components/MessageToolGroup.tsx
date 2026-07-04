@@ -4,9 +4,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { Copy, Download, Loader2 } from 'lucide-react';
+import { Copy, Download, ExternalLink, Loader2 } from 'lucide-react';
 import { ipcBridge } from '@/common';
 import type { IMessageToolGroup } from '@/common/chat/chatLib';
+import { redactCommandSecrets } from '@/common/utils/redactCommandSecrets';
 import { iconColors } from '@/renderer/styles/colors';
 import { Alert, Button, Image, Message, Radio, Tag, Tooltip } from '@arco-design/web-react';
 import React, { useCallback, useContext, useMemo, useState } from 'react';
@@ -19,6 +20,8 @@ import CollapsibleContent from '@renderer/components/chat/CollapsibleContent';
 import LocalImageView from '@renderer/components/media/LocalImageView';
 import MarkdownView from '@renderer/components/Markdown';
 import { ToolConfirmationOutcome } from '@renderer/utils/common';
+import { openExternalUrl } from '@/renderer/utils/platform';
+import { extractGoogleConsentUrl } from '@/renderer/utils/mcp/googleConsentUrl';
 import { ImagePreviewContext } from '../MessageList';
 import { COLLAPSE_CONFIG, TEXT_CONFIG } from '../constants';
 import type { ImageGenerationResult, WriteFileResult } from '../types';
@@ -94,6 +97,13 @@ const useConfirmationButtons = (
           );
         }
         break;
+      case 'question':
+        // #504: an AskUserQuestion is answered in the confirmation dialog
+        // (ConversationChatConfirm), whose options carry the choice's `answer`
+        // back to the engine. The inline card only displays the question +
+        // choices (see the `node` switch), so no inline buttons here.
+        question = '';
+        break;
       default: {
         const mcpProps = confirmationDetails;
         question = t('messages.confirmation.allowMCPTool', {
@@ -167,7 +177,9 @@ const ConfirmationDetails: React.FC<{
       case 'edit':
         return null; // Rendered separately below with hooks support
       case 'exec': {
-        const bashSnippet = `\`\`\`bash\n${confirmationDetails.command}\n\`\`\``;
+        // Mask inline secrets (Bearer tokens, sk- keys, key=value pairs) before
+        // rendering the real command in the expanded card (#610).
+        const bashSnippet = `\`\`\`bash\n${redactCommandSecrets(confirmationDetails.command)}\n\`\`\``;
         return (
           <div className='w-full max-w-100% min-w-0'>
             <MarkdownView codeStyle={CODE_STYLE}>{bashSnippet}</MarkdownView>
@@ -178,6 +190,22 @@ const ConfirmationDetails: React.FC<{
         return <span className='text-t-primary'>{confirmationDetails.prompt}</span>;
       case 'mcp':
         return <span className='text-t-primary'>{confirmationDetails.toolDisplayName}</span>;
+      case 'question':
+        // #504: show the question and its choices (read-only). The actual pick
+        // is made in the confirmation dialog, which returns the chosen answer.
+        return (
+          <div className='text-t-primary'>
+            <div className='font-medium'>{confirmationDetails.question}</div>
+            <ul className='mt-6px pl-18px list-disc'>
+              {confirmationDetails.choices.map((choice, i) => (
+                <li key={choice.label + i}>
+                  <span>{choice.label}</span>
+                  {choice.description && <span className='text-t-secondary'> — {choice.description}</span>}
+                </li>
+              ))}
+            </ul>
+          </div>
+        );
     }
   }, [confirmationDetails]);
 
@@ -198,7 +226,7 @@ const ConfirmationDetails: React.FC<{
       ) : (
         node
       )}
-      {content.status === 'Confirming' && (
+      {content.status === 'Confirming' && confirmationDetails.type !== 'question' && (
         <>
           <div className='mt-10px text-t-primary'>{question}</div>
           <Radio.Group direction='vertical' size='mini' value={selected} onChange={setSelected}>
@@ -410,10 +438,18 @@ const ImageDisplay: React.FC<{
   );
 };
 
-const ToolResultDisplay: React.FC<{
+export const ToolResultDisplay: React.FC<{
   content: IMessageToolGroupProps['message']['content'][number];
 }> = ({ content }) => {
+  const { t } = useTranslation();
   const { resultDisplay, name } = content;
+
+  // Google Workspace MCP OAuth (#475): start_google_auth returns a consent URL
+  // as plain text. The <pre> below isn't clickable, so surface an explicit
+  // always-visible button that opens the consent page in the browser. Scoped to
+  // that tool + accounts.google.com so arbitrary tool output can't be turned
+  // into a one-click link.
+  const consentUrl = extractGoogleConsentUrl(name, resultDisplay);
 
   // Special handling for image generation
   if (name === 'ImageGeneration' && typeof resultDisplay === 'object') {
@@ -436,14 +472,27 @@ const ToolResultDisplay: React.FC<{
 
   // Wrap long content with CollapsibleContent
   return (
-    <CollapsibleContent maxHeight={RESULT_MAX_HEIGHT} defaultCollapsed={true} useMask={false}>
-      <pre
-        className='text-t-primary whitespace-pre-wrap break-words m-0'
-        style={{ fontSize: `${TEXT_CONFIG.FONT_SIZE}px`, lineHeight: TEXT_CONFIG.LINE_HEIGHT }}
-      >
-        {display}
-      </pre>
-    </CollapsibleContent>
+    <>
+      {consentUrl && (
+        <Button
+          type='primary'
+          size='small'
+          className='mb-8px'
+          icon={<ExternalLink size={14} />}
+          onClick={() => void openExternalUrl(consentUrl)}
+        >
+          {t('conversation.tool.openGoogleConsent')}
+        </Button>
+      )}
+      <CollapsibleContent maxHeight={RESULT_MAX_HEIGHT} defaultCollapsed={true} useMask={false}>
+        <pre
+          className='text-t-primary whitespace-pre-wrap break-words m-0'
+          style={{ fontSize: `${TEXT_CONFIG.FONT_SIZE}px`, lineHeight: TEXT_CONFIG.LINE_HEIGHT }}
+        >
+          {display}
+        </pre>
+      </CollapsibleContent>
+    </>
   );
 };
 
@@ -543,11 +592,7 @@ const MessageToolGroup: React.FC<IMessageToolGroupProps> = ({ message }) => {
                       ? 'warning'
                       : 'info'
               }
-              icon={
-                isLoading && (
-                  <Loader2 size={12} color={iconColors.primary} className='loading lh-[1] flex' />
-                )
-              }
+              icon={isLoading && <Loader2 size={12} color={iconColors.primary} className='loading lh-[1] flex' />}
               content={
                 <div>
                   <Tag className={'mr-4px'}>
@@ -564,7 +609,7 @@ const MessageToolGroup: React.FC<IMessageToolGroupProps> = ({ message }) => {
                   <div
                     className={`text-12px text-t-secondary mb-2 ${status === 'Error' ? 'whitespace-pre-wrap break-words' : 'truncate'}`}
                   >
-                    {description}
+                    {redactCommandSecrets(description)}
                   </div>
                 )}
                 {resultDisplay && (

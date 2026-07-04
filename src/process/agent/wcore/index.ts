@@ -11,15 +11,46 @@ import { createInterface } from 'node:readline';
 import { parse, stringify } from 'smol-toml';
 import type { TProviderWithModel } from '@/common/config/storage';
 import { resolveWCoreBinary } from './binaryResolver';
-import { buildEngineSpawnEnv, buildSpawnConfig } from './envBuilder';
+import { buildEngineSpawnEnv, buildSpawnConfig, engineInheritsShellKey, MissingApiKeyError } from './envBuilder';
 import { resolveActiveConfigDir } from './profilePaths';
 import { getToolKeyStore } from './toolKeyStore';
 import { hydrateModelForSpawn } from '@process/providers/ipc/modelRegistryIpc';
+import { killChild } from '@process/agent/acp/utils';
+import { trackAgentChild } from '@process/agent/agentChildRegistry';
 import type { WCoreEvent, WCoreCommand, WCoreCapabilities } from './protocol';
+import { parseQuestionTool } from './questionTool';
+import { handleHostSendMessageRequest, defaultHostSendDeps } from './hostSendMessage';
 
 const WCORE_PROJECT_CONFIG = '.wcore.toml';
 
-type StreamEventHandler = (event: { type: string; data: unknown; msg_id: string }) => void;
+// Keep the last ~2KB of engine stderr so a spawn/init failure can surface the
+// engine's real bail reason (e.g. a keyless model, bad config) instead of an
+// opaque "exited with code N" (#484). Capped to bound memory on a chatty engine.
+const WCORE_STDERR_TAIL_MAX = 2048;
+
+// High-confidence secret shapes to mask before engine stderr is surfaced into the
+// user-facing error UI (#484 audit). Init failures shouldn't echo credentials,
+// but stderr is untrusted engine output, so scrub known token formats defensively
+// (the full text still goes to the local console log for debugging). Conservative
+// on purpose: only well-known prefixes + bearer tokens, so real error text is
+// preserved.
+const SECRET_PATTERNS: RegExp[] = [
+  /\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}\b/g, // OpenAI / Stripe style
+  /\bBearer\s+[A-Za-z0-9._-]{16,}\b/gi, // Authorization: Bearer <token>
+  /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b/g, // GitHub tokens
+  /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g, // Slack tokens
+  /\bAKIA[0-9A-Z]{16}\b/g, // AWS access key id
+];
+
+function redactSecrets(text: string): string {
+  let out = text;
+  for (const pattern of SECRET_PATTERNS) {
+    out = out.replace(pattern, '[redacted]');
+  }
+  return out;
+}
+
+type StreamEventHandler = (event: { type: string; data: unknown; msg_id: string; subject?: string }) => void;
 
 /**
  * Sanitize an existing `.wcore.toml` body and merge in the app's own provider
@@ -130,19 +161,39 @@ export class WCoreAgent {
   private _onPong: WCoreAgentOptions['onPong'];
   private options: WCoreAgentOptions;
   private activeMsgId: string | null = null;
+  // #520 command visibility: the wire's `tool_running` / `tool_result` events
+  // carry only `call_id` + `tool_name` - not the command/description. The engine
+  // sends the humanized command (e.g. "Execute: ls") once, on the preceding
+  // `tool_request` (ToolInfo.description). The renderer merges tool_group frames
+  // by callId with a plain `{...existing, ...incoming}` spread, so an incoming
+  // empty `description` OVERWRITES the command shown at request time - which is
+  // why the running/finished card lost the command after 0.11.2. We stash the
+  // request-time description per callId and re-attach it to the running/result
+  // frames so the command stays visible for the whole tool lifecycle.
+  private toolDescriptionByCallId = new Map<string, string>();
   private configBackup: { path: string; content: string | null; written: string | null } | null = null;
   private mcpReadyPromise: Promise<void>;
   private mcpReadyResolve!: () => void;
   public sessionId?: string;
   public capabilities?: WCoreCapabilities;
   /**
-   * The `--max-tokens` value actually passed to wcore, after applying the
-   * reasoning-model default fallback in `buildSpawnConfig`. `undefined` when
-   * no `--max-tokens` arg was added. Set during `start()`; `WCoreManager`
-   * mirrors this into `data.data.maxTokens` so the truncation heuristic
-   * compares `output_tokens` against the real budget rather than `undefined`.
+   * The `--max-tokens` value actually passed to wcore. As of #456 this is
+   * explicit-only: it is set when the caller passed an explicit `maxTokens`,
+   * and otherwise `undefined` (no `--max-tokens` arg added) so the engine
+   * sizes the budget per-model itself (`size_output_cap`). Set during
+   * `start()`. `WCoreManager` still mirrors a defined value into
+   * `data.data.maxTokens`, but the legacy `output_tokens`-vs-budget truncation
+   * heuristic is retired in favour of the engine's definitive
+   * `finish_reason:'length'`, so an `undefined` value here no longer weakens
+   * truncation detection.
    */
   public resolvedMaxTokens?: number;
+  /**
+   * Rolling tail of the engine's stderr (last ~2KB). Captured so a failed spawn
+   * or a ready-timeout can surface the engine's real bail reason rather than an
+   * opaque exit code (#484).
+   */
+  private stderrTail = '';
 
   constructor(options: WCoreAgentOptions) {
     this.options = options;
@@ -190,19 +241,36 @@ export class WCoreAgent {
     // and is never persisted. Per-call resolution keeps concurrent chats on
     // different accounts isolated (audit C6); raw-engine mode ignores the model
     // (it uses the engine's own config.toml), so skip the lookup there.
-    const spawnModel = this.options.rawEngineMode
-      ? this.options.model
-      : await hydrateModelForSpawn(this.options.model);
+    const spawnModel = this.options.rawEngineMode ? this.options.model : await hydrateModelForSpawn(this.options.model);
 
-    const { args, env, projectConfig, resolvedMaxTokens } = buildSpawnConfig(spawnModel, {
-      workspace: this.options.workspace,
-      maxTokens: this.options.maxTokens,
-      maxTurns: this.options.maxTurns,
-      autoApprove: this.options.yoloMode,
-      sessionId: this.options.sessionId,
-      resume: this.options.resume,
-      rawEngine: this.options.rawEngineMode,
-    });
+    const { args, env, projectConfig, resolvedMaxTokens, missingRequiredApiKey, requiredKeyEnvVar } = buildSpawnConfig(
+      spawnModel,
+      {
+        workspace: this.options.workspace,
+        maxTokens: this.options.maxTokens,
+        maxTurns: this.options.maxTurns,
+        autoApprove: this.options.yoloMode,
+        sessionId: this.options.sessionId,
+        resume: this.options.resume,
+        rawEngine: this.options.rawEngineMode,
+      }
+    );
+
+    // #629: refuse to spawn a doomed keyless engine. When the chosen provider
+    // needs an API key but `model.apiKey` resolved empty (e.g. a Flux/BYO key
+    // that was never persisted came back blank after a credit top-up), spawning
+    // would burn a 30s ready-timeout and then surface a raw "No API key found"
+    // with no recovery path. Fail fast with a classifiable error so the desktop
+    // routes the user to the credential-recovery card (re-enter key / reconnect
+    // Flux) instead. ChatGPT-OAuth, keyless-local openai, and raw-engine mode
+    // never set this flag. Skip the guard when the engine would still inherit a
+    // matching provider key from the user's SHELL (buildEngineSpawnEnv passes
+    // allowlisted keys through) - that spawn is authenticated, so blocking it
+    // would wrongly push a shell-key user to re-enter a key they already have.
+    if (missingRequiredApiKey && !engineInheritsShellKey(requiredKeyEnvVar)) {
+      throw new MissingApiKeyError(spawnModel.useModel);
+    }
+
     this.resolvedMaxTokens = resolvedMaxTokens;
 
     // Write temporary .wcore.toml for provider compat overrides
@@ -230,6 +298,10 @@ export class WCoreAgent {
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: this.options.workspace,
     });
+    // #443: register with the last-resort reaper so a quit that truncates the
+    // graceful per-agent kill still force-kills this engine child (auto-removed
+    // on exit / graceful kill).
+    trackAgentChild(this.childProcess);
 
     // Parse stdout JSON Lines
     const rl = createInterface({ input: this.childProcess.stdout! });
@@ -242,16 +314,29 @@ export class WCoreAgent {
       }
     });
 
-    // Log stderr as diagnostics
+    // Log stderr as diagnostics and retain the tail for failure surfacing (#484).
     this.childProcess.stderr?.on('data', (chunk: Buffer) => {
-      console.error('[wcore]', chunk.toString());
+      const text = chunk.toString();
+      console.error('[wcore]', text);
+      this.stderrTail = (this.stderrTail + text).slice(-WCORE_STDERR_TAIL_MAX);
     });
 
     // Handle process exit
     this.childProcess.on('exit', (code) => {
       this.restoreProjectConfig();
       if (!this.ready) {
-        this.readyReject(new Error(`wcore exited with code ${code} during init`));
+        // Surface the engine's real bail reason (its last stderr) alongside the
+        // exit code so callers see the cause, not just "exited with code N"
+        // (#484). The "exited with code" wording distinguishes an engine that
+        // died during init from the separate 30s ready-timeout below.
+        const detail = redactSecrets(this.stderrTail.trim());
+        this.readyReject(
+          new Error(
+            detail
+              ? `wcore exited with code ${code} during init: ${detail}`
+              : `wcore exited with code ${code} during init`
+          )
+        );
       }
       if (this.activeMsgId && this._onProcessExit) {
         this._onProcessExit(code, this.activeMsgId);
@@ -260,9 +345,16 @@ export class WCoreAgent {
       this.childProcess = null;
     });
 
-    // Wait for ready event with timeout
+    // Wait for ready event with timeout. On timeout, include the engine's last
+    // stderr too: a hung engine that logged an error but never exited (e.g. it's
+    // blocked waiting on something) otherwise surfaces only a bare "timeout"
+    // (#484). The "ready timeout (30s)" wording keeps this case distinct from an
+    // engine that exited during init (handled above).
     const timeout = new Promise<void>((_, reject) => {
-      setTimeout(() => reject(new Error('wcore ready timeout (30s)')), 30000);
+      setTimeout(() => {
+        const detail = redactSecrets(this.stderrTail.trim());
+        reject(new Error(detail ? `wcore ready timeout (30s): ${detail}` : 'wcore ready timeout (30s)'));
+      }, 30000);
     });
 
     try {
@@ -271,6 +363,23 @@ export class WCoreAgent {
       // If resume failed (session not found), fallback to a new session
       if (this.options.resume) {
         console.error('[WCoreAgent] Resume failed, falling back to new session:', err);
+        // Tear down the failed resume attempt before recursing. The ready-timeout
+        // path leaves the engine alive, and its exit/stderr listeners read this.*
+        // dynamically - once we recurse they'd point at the fresh attempt, so a
+        // late exit or stderr chunk from the orphaned child could reject the new
+        // session, restore the wrong .wcore.toml, or contaminate the stderr tail.
+        // Detach its listeners, kill it best-effort, and reset the tail so the
+        // next failure surfaces only its own output (#484 audit).
+        const staleChild = this.childProcess;
+        if (staleChild) {
+          rl.close();
+          staleChild.removeAllListeners();
+          staleChild.stdout?.removeAllListeners();
+          staleChild.stderr?.removeAllListeners();
+          void killChild(staleChild, false).catch(() => {});
+        }
+        this.childProcess = null;
+        this.stderrTail = '';
         this.options = { ...this.options, resume: undefined, sessionId: this.options.resume };
         this.ready = false;
         this.readyPromise = new Promise((resolve, reject) => {
@@ -340,10 +449,13 @@ export class WCoreAgent {
         break;
 
       case 'thinking':
-        this.onStreamEvent({ type: 'thought', data: event.text, msg_id: event.msg_id });
+        this.onStreamEvent({ type: 'thought', data: event.text, msg_id: event.msg_id, subject: event.subject });
         break;
 
       case 'tool_request':
+        // #520: remember the request-time command so the later running/result
+        // frames (which the wire sends without it) can re-surface it.
+        this.toolDescriptionByCallId.set(event.call_id, event.tool.description);
         this.onStreamEvent({
           type: 'tool_group',
           data: [
@@ -367,7 +479,8 @@ export class WCoreAgent {
             {
               callId: event.call_id,
               name: event.tool_name,
-              description: '',
+              // #520: carry the command forward (empty string would clobber it).
+              description: this.toolDescriptionByCallId.get(event.call_id) ?? '',
               status: 'Executing',
               renderOutputAsMarkdown: false,
             },
@@ -383,7 +496,9 @@ export class WCoreAgent {
             {
               callId: event.call_id,
               name: event.tool_name,
-              description: '',
+              // #520: keep the command on the finished card too (the result frame
+              // omits it, and the merge would otherwise blank it out).
+              description: this.toolDescriptionByCallId.get(event.call_id) ?? '',
               status: event.status === 'success' ? 'Success' : 'Error',
               resultDisplay:
                 event.output_type === 'diff'
@@ -394,6 +509,8 @@ export class WCoreAgent {
           ],
           msg_id: event.msg_id,
         });
+        // #520: the tool is terminal - drop its cached command.
+        this.toolDescriptionByCallId.delete(event.call_id);
         break;
 
       case 'tool_cancelled':
@@ -410,6 +527,8 @@ export class WCoreAgent {
           ],
           msg_id: event.msg_id,
         });
+        // #520: terminal - drop its cached command.
+        this.toolDescriptionByCallId.delete(event.call_id);
         break;
 
       case 'stream_end': {
@@ -574,6 +693,18 @@ export class WCoreAgent {
             }${event.error ? `: ${event.error}` : ''}`,
             msg_id: this.activeMsgId ?? '',
           });
+          // #252: also surface the open transition as an activity-tree node so
+          // failover (which fallback provider took over) is visible in-line.
+          this.onStreamEvent({
+            type: 'provider_circuit_event',
+            data: {
+              primary: event.primary,
+              fallback: event.fallback,
+              state: event.state,
+              error: event.error,
+            },
+            msg_id: this.activeMsgId ?? '',
+          });
         }
         break;
 
@@ -641,6 +772,9 @@ export class WCoreAgent {
         break;
 
       // ── W6 F7: end-of-session cost aggregate ──────────────────────
+      // #252: stamp the active msg_id so the renderer attaches the per-turn
+      // cost rows to the in-flight turn's activity card. WCoreManager
+      // force-forwards this past the empty-msg_id guard.
       case 'session_cost':
         this.onStreamEvent({
           type: 'session_cost',
@@ -649,7 +783,7 @@ export class WCoreAgent {
             totalCostUsd: event.total_cost_usd,
             perTurn: event.per_turn,
           },
-          msg_id: '',
+          msg_id: this.activeMsgId ?? '',
         });
         break;
 
@@ -696,6 +830,15 @@ export class WCoreAgent {
         });
         break;
 
+      // ── #537 host-delegated send_message ──────────────────────────
+      // The engine (spawned with WAYLAND_SEND_MESSAGE_HOST_DELEGATE=1) routes an
+      // agent `send_message` here instead of failing on its empty channel table.
+      // We fulfil it through the desktop's own outbound channel plugins and reply
+      // with the result, correlated by call_id.
+      case 'host_send_message_request':
+        void this.handleHostSendMessage(event);
+        break;
+
       // ── Forward-compat default arm ────────────────────────────────
       // The W0 Host Decoder Contract (docs/json-stream-protocol.md
       // §"Host Decoder Contract") says hosts MUST drop unknown event
@@ -719,10 +862,36 @@ export class WCoreAgent {
   }
 
   /**
+   * #537: fulfil a host-delegated `send_message` via the desktop's outbound
+   * channel plugins and reply with `host_send_message_result`. Always replies
+   * (even on failure) so the engine's tool call never hangs; the handler itself
+   * never throws.
+   */
+  private async handleHostSendMessage(event: WCoreEvent & { type: 'host_send_message_request' }): Promise<void> {
+    const result = await handleHostSendMessageRequest(event, defaultHostSendDeps());
+    this.sendCommand({
+      type: 'host_send_message_result',
+      call_id: event.call_id,
+      ok: result.ok,
+      ...(result.message_id ? { message_id: result.message_id } : {}),
+      ...(result.error ? { error: result.error } : {}),
+    });
+  }
+
+  /**
    * Map wcore tool_request to wayland confirmation details format.
    */
   private mapConfirmationDetails(event: WCoreEvent & { type: 'tool_request' }) {
     const { tool } = event;
+
+    // #504: AskUserQuestion arrives as an `info`-category tool (the engine has
+    // no `question` ToolCategory), with the question + choices inside args. It
+    // used to fall through to the `info` branch and render an empty approval
+    // box. Detect it by name and lift the choices out so the renderer can show
+    // them as selectable answers. The name guard mirrors the engine's own
+    // answer-synth guard (tool_name == "AskUserQuestion").
+    const question = parseQuestionTool(tool);
+    if (question) return question;
 
     switch (tool.category) {
       case 'edit':
@@ -781,12 +950,24 @@ export class WCoreAgent {
     this.sendCommand({ type: 'stop' });
   }
 
-  approveTool(callId: string, scope: 'once' | 'always' = 'once'): void {
-    this.sendCommand({ type: 'tool_approve', call_id: callId, scope });
+  approveTool(callId: string, scope: 'once' | 'always' = 'once', answer?: string): void {
+    // `answer` carries an AskUserQuestion choice back through the approval
+    // channel (see WCoreCommand.tool_approve). Only attach when present so a
+    // plain approval keeps its exact prior wire shape.
+    this.sendCommand({ type: 'tool_approve', call_id: callId, scope, ...(answer ? { answer } : {}) });
   }
 
   denyTool(callId: string, reason = ''): void {
     this.sendCommand({ type: 'tool_deny', call_id: callId, reason });
+  }
+
+  // W7 S4 HITL: resume a turn the engine suspended with `approval_required`.
+  // The engine normally self-resolves this under --auto-approve, but that path
+  // can silently fail on some provider routes (e.g. Anthropic-format `toolu_`
+  // tool ids via Flux), leaving the turn wedged. Sending an explicit resume is
+  // a safe, idempotent unblock (a stale/duplicate token is ignored engine-side).
+  resumeApproval(resumeToken: string, approved: boolean): void {
+    this.sendCommand({ type: 'approval_resume', resume_token: resumeToken, approved });
   }
 
   setConfig(config: { model?: string; thinking?: string; thinking_budget?: number; effort?: string }): void {
@@ -805,11 +986,16 @@ export class WCoreAgent {
     return this.childProcess !== null;
   }
 
-  kill(): void {
+  async kill(): Promise<void> {
     this.restoreProjectConfig();
     if (this.childProcess) {
-      this.childProcess.kill('SIGTERM');
+      // wayland-core spawns its own child tree (MCP servers, tool subprocesses).
+      // A bare SIGTERM is a no-op on Windows and never reaches the tree, leaving
+      // orphaned processes after quit (#139). killChild does a taskkill /T /F on
+      // win32 and a SIGTERM->SIGKILL descendant sweep on POSIX.
+      const child = this.childProcess;
       this.childProcess = null;
+      await killChild(child, false);
     }
   }
 
